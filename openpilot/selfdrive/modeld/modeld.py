@@ -133,6 +133,20 @@ class ModelState:
       outputs_dict['raw_pred'] = model_output.copy()
     return outputs_dict
 
+  def warmup(self) -> None:
+    bufs = {k: np.zeros(self.frame_buf_params[k][3], dtype=np.uint8) for k in self.vision_input_names}
+    transforms = {k: np.zeros((3, 3), dtype=np.float32) for k in self.vision_input_names}
+    inputs = {
+      'desire_pulse': np.zeros(ModelConstants.DESIRE_LEN, dtype=np.float32),
+      'traffic_convention': np.zeros(2, dtype=np.float32),
+      'action_t': np.zeros(2, dtype=np.float32),
+    }
+    self.run(bufs, transforms, inputs)
+    self.prev_desire.fill(0)
+    self.input_queues, self.npy = make_input_queues(self.input_shapes, self.frame_skip, device=self.QUEUE_DEV)
+    self.full_frames.clear()
+    self._blob_cache.clear()
+
 
 def main(demo=False):
   cloudlog.warning("modeld init")
@@ -169,11 +183,20 @@ def main(demo=False):
   if use_extra_client:
     cloudlog.warning(f"connected extra cam with buffer size: {vipc_client_extra.buffer_len} ({vipc_client_extra.width} x {vipc_client_extra.height})")
 
-  if USBGPU:
-    wait_usbgpu_link()
   st = time.monotonic()
   cloudlog.warning("loading model")
-  model = ModelState(vipc_client_main.width, vipc_client_main.height, USBGPU)
+  model = None
+  if USBGPU:
+    params.put_bool("UsbGpuLoading", True)  # engaging is refused until the model is ready
+    try:
+      wait_usbgpu_link()
+      model = ModelState(vipc_client_main.width, vipc_client_main.height, True)
+      model.warmup()
+    except Exception:
+      cloudlog.exception("big model failed to load, falling back to small")
+    params.put_bool("UsbGpuLoading", False)
+  if model is None:
+    model = ModelState(vipc_client_main.width, vipc_client_main.height, False)
   cloudlog.warning(f"models loaded in {time.monotonic() - st:.1f}s, modeld starting")
 
   # messaging

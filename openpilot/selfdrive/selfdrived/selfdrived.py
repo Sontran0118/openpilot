@@ -65,6 +65,7 @@ class SelfdriveD:
     self.calibrated_pose: Pose | None = None
     self.excessive_actuation_check = ExcessiveActuationCheck()
     self.excessive_actuation = self.params.get("Offroad_ExcessiveActuation") is not None
+    self.big_model_loading = False
 
     # Setup sockets
     self.pm = messaging.PubMaster(['selfdriveState', 'onroadEvents'])
@@ -153,6 +154,11 @@ class SelfdriveD:
     if self.sm['controlsState'].lateralControlState.which() == 'debugState':
       self.events.add(EventName.joystickDebug)
       self.startup_event = None
+
+    if self.sm.frame % 100 == 0:
+      self.big_model_loading = self.params.get_bool("UsbGpuLoading")
+    if self.big_model_loading:
+      self.events.add(EventName.bigModelLoading)
 
     if self.sm.recv_frame['lateralManeuverPlan'] > 0:
       self.events.add(EventName.lateralManeuver)

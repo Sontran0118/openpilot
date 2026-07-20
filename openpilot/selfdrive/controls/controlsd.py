@@ -99,7 +99,7 @@ class Controls:
     standstill = abs(CS.vEgo) <= max(self.CP.minSteerSpeed, 0.3) or CS.standstill
     CC.latActive = self.sm['selfdriveState'].active and not CS.steerFaultTemporary and not CS.steerFaultPermanent and \
                    (not standstill or self.CP.steerAtStandstill)
-    mads_lat_only = self.sm['selfdriveState'].madsAvailable and not CS.cruiseState.enabled
+    mads_lat_only = self.sm['selfdriveState'].state == State.lateralEnabled
     CC.longActive = CC.enabled and not mads_lat_only and \
                     not any(e.overrideLongitudinal for e in self.sm['onroadEvents']) and self.CP.openpilotLongitudinalControl
 

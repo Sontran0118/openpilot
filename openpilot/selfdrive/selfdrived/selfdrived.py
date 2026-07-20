@@ -541,7 +541,8 @@ class SelfdriveD:
     CS = self.data_sample()
     self.update_events(CS)
     if not self.CP.passive and self.initialized:
-      self.enabled, self.active = self.state_machine.update(self.events)
+      lateral_only = self.mads_available and CS.cruiseState.available and not CS.cruiseState.enabled
+      self.enabled, self.active = self.state_machine.update(self.events, lateral_only=lateral_only)
     self.update_alerts(CS)
 
     self.publish_selfdriveState(CS)

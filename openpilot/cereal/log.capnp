@@ -823,6 +823,7 @@ struct SelfdriveState {
     enabled @2;
     softDisabling @3;
     overriding @4;  # superset of overriding with steering or accelerator
+    lateralEnabled @5;  # MADS lateral control active without ACC
   }
 
   enum AlertStatus @0xa0d0dcd113193c62 {

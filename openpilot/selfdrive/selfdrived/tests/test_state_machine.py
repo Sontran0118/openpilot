@@ -145,9 +145,27 @@ class TestStateMachine:
 
     self.events.clear()
     self.state_machine.update(self.events, lateral_only=False, mads_requested=True)
+    assert self.state_machine.state == State.disabled
+
+    self.state_machine.update(self.events, lateral_only=False, mads_requested=False)
+    self.state_machine.update(self.events, lateral_only=False, mads_requested=True)
     assert self.state_machine.state == State.enabled
 
   def test_mads_does_not_engage_during_immediate_disable(self):
     self.events.add(make_event([ET.ENABLE, ET.IMMEDIATE_DISABLE]))
     self.state_machine.update(self.events, lateral_only=True, mads_requested=True)
     assert self.state_machine.state == State.disabled
+
+  def test_mads_disengagement_requires_main_cycle(self):
+    self.state_machine.state = State.lateralEnabled
+    self.events.add(make_event([ET.IMMEDIATE_DISABLE]))
+    self.state_machine.update(self.events, lateral_only=True, mads_requested=True)
+    assert self.state_machine.state == State.disabled
+
+    self.events.clear()
+    self.state_machine.update(self.events, lateral_only=True, mads_requested=True)
+    assert self.state_machine.state == State.disabled
+
+    self.state_machine.update(self.events, lateral_only=False, mads_requested=False)
+    self.state_machine.update(self.events, lateral_only=True, mads_requested=True)
+    assert self.state_machine.state == State.lateralEnabled

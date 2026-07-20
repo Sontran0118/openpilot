@@ -13,8 +13,12 @@ class StateMachine:
     self.current_alert_types = [ET.PERMANENT]
     self.state = State.disabled
     self.soft_disable_timer = 0
+    self.mads_blocked = False
 
   def update(self, events: Events, lateral_only: bool | None = None, mads_requested: bool = False):
+    if not mads_requested:
+      self.mads_blocked = False
+
     if lateral_only is None:
       lateral_only = self.state == State.lateralEnabled
     nominal_state = State.lateralEnabled if lateral_only else State.enabled
@@ -30,10 +34,12 @@ class StateMachine:
       # user and immediate disable always have priority in a non-disabled state
       if events.contains(ET.IMMEDIATE_DISABLE):
         self.state = State.disabled
+        self.mads_blocked = mads_requested
         self.current_alert_types.append(ET.IMMEDIATE_DISABLE)
 
       elif events.contains(ET.USER_DISABLE):
         self.state = State.disabled
+        self.mads_blocked = mads_requested
         self.current_alert_types.append(ET.USER_DISABLE)
 
       else:
@@ -61,6 +67,7 @@ class StateMachine:
 
           elif self.soft_disable_timer <= 0:
             self.state = State.disabled
+            self.mads_blocked = mads_requested
 
         # PRE ENABLING
         elif self.state == State.preEnabled:
@@ -85,8 +92,8 @@ class StateMachine:
       # MADS is level-triggered by the main switch. This lets lateral control
       # engage once a transient no-entry/soft-disable condition clears without
       # requiring the driver to cycle the main switch again.
-      mads_blocked = mads_requested and any(events.contains(et) for et in (ET.IMMEDIATE_DISABLE, ET.USER_DISABLE, ET.SOFT_DISABLE))
-      if (events.contains(ET.ENABLE) or mads_requested) and not mads_blocked:
+      blocking_event = any(events.contains(et) for et in (ET.IMMEDIATE_DISABLE, ET.USER_DISABLE, ET.SOFT_DISABLE))
+      if (events.contains(ET.ENABLE) or mads_requested) and not (mads_requested and (self.mads_blocked or blocking_event)):
         if events.contains(ET.NO_ENTRY):
           self.current_alert_types.append(ET.NO_ENTRY)
 

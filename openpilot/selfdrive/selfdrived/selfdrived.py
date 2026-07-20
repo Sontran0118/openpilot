@@ -493,9 +493,10 @@ class SelfdriveD:
       self.mismatch_counter = 0
 
     # All pandas not in silent mode must have controlsAllowed when openpilot is enabled
-    if self.enabled and any(not (ps.controlsAllowed or (self.mads_available and ps.controlsAllowedLateral)) for ps in self.sm['pandaStates']
-           if ps.safetyModel not in IGNORED_SAFETY_MODES):
-      self.mismatch_counter += 1
+    if self.enabled:
+      controls_mismatch = any(not (ps.controlsAllowed or (self.mads_available and ps.controlsAllowedLateral)) for ps in self.sm['pandaStates']
+                              if ps.safetyModel not in IGNORED_SAFETY_MODES)
+      self.mismatch_counter = self.mismatch_counter + 1 if controls_mismatch else 0
 
     return CS
 

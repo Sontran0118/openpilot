@@ -533,7 +533,7 @@ class SelfdriveD:
     ss.engageable = not self.events.contains(ET.NO_ENTRY)
     ss.experimentalMode = self.experimental_mode
     ss.personality = self.personality
-    ss.madsEnabled = self.mads_available and self.active
+    ss.madsEnabled = self.mads_available and self.sm['carControl'].latActive
     ss.madsAvailable = self.mads_available
 
     ss.alertText1 = self.AM.current_alert.alert_text_1

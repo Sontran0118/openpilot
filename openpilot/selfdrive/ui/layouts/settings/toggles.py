@@ -219,9 +219,8 @@ class TogglesLayout(Widget):
       mads_supported = ui_state.CP.carFingerprint == HYUNDAI_CAR.HYUNDAI_SONATA and ui_state.CP.pcmCruise
       mads_locked = "MadsEnabled" in self._locked_toggles
       self._toggles["MadsEnabled"].action_item.set_enabled(mads_supported and not mads_locked and not ui_state.engaged)
-      if not mads_supported:
-        self._toggles["MadsEnabled"].set_description(
-          tr("MADS is currently available only on the Hyundai Sonata platform."))
+      mads_description = DESCRIPTIONS["MadsEnabled"] if mads_supported else tr("MADS is currently available only on the Hyundai Sonata platform.")
+      self._toggles["MadsEnabled"].set_description(mads_description)
 
   def _render(self, rect):
     self._scroller.render(rect)

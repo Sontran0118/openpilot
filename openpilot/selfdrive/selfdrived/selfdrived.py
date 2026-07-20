@@ -7,6 +7,7 @@ import openpilot.cereal.messaging as messaging
 
 from openpilot.cereal import log
 from opendbc.car.structs import car
+from opendbc.safety import ALTERNATIVE_EXPERIENCE
 from msgq.visionipc import VisionIpcClient, VisionStreamType
 
 
@@ -96,6 +97,7 @@ class SelfdriveD:
     self.is_metric = self.params.get_bool("IsMetric")
     self.is_ldw_enabled = self.params.get_bool("IsLdwEnabled")
     self.disengage_on_accelerator = self.params.get_bool("DisengageOnAccelerator")
+    self.mads_available = bool(self.CP.alternativeExperience & ALTERNATIVE_EXPERIENCE.ENABLE_MADS)
 
     car_recognized = self.CP.brand != 'mock'
 
@@ -216,6 +218,16 @@ class SelfdriveD:
     if CS.canValid:
       car_events = self.car_events.update(CS, self.CS_prev, self.sm['carControl']).to_msg()
       self.events.add_from_msg(car_events)
+
+      if self.mads_available:
+        # The main switch owns lateral engagement. ACC transitions only change
+        # the stock longitudinal controller while the main switch remains on.
+        if CS.cruiseState.available:
+          self.events.remove(EventName.pcmDisable)
+          self.events.remove(EventName.buttonCancel)
+          self.events.remove(EventName.pedalPressed)
+          if not self.CS_prev.cruiseState.available:
+            self.events.add(EventName.pcmEnable)
 
       if self.CP.notCar:
         # wait for everything to init first
@@ -474,7 +486,7 @@ class SelfdriveD:
       self.mismatch_counter = 0
 
     # All pandas not in silent mode must have controlsAllowed when openpilot is enabled
-    if self.enabled and any(not ps.controlsAllowed for ps in self.sm['pandaStates']
+    if self.enabled and any(not (ps.controlsAllowed or (self.mads_available and ps.controlsAllowedLateral)) for ps in self.sm['pandaStates']
            if ps.safetyModel not in IGNORED_SAFETY_MODES):
       self.mismatch_counter += 1
 
@@ -504,6 +516,8 @@ class SelfdriveD:
     ss.engageable = not self.events.contains(ET.NO_ENTRY)
     ss.experimentalMode = self.experimental_mode
     ss.personality = self.personality
+    ss.madsEnabled = self.mads_available and self.enabled
+    ss.madsAvailable = self.mads_available
 
     ss.alertText1 = self.AM.current_alert.alert_text_1
     ss.alertText2 = self.AM.current_alert.alert_text_2

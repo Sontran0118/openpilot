@@ -8,6 +8,7 @@ from openpilot.system.ui.lib.application import gui_app
 from openpilot.system.ui.lib.multilang import tr, tr_noop
 from openpilot.system.ui.widgets import DialogResult
 from openpilot.selfdrive.ui.ui_state import ui_state
+from opendbc.car.hyundai.values import CAR as HYUNDAI_CAR
 
 PERSONALITY_TO_INT = log.LongitudinalPersonality.schema.enumerants
 
@@ -18,6 +19,9 @@ DESCRIPTIONS = {
     "Your attention is required at all times to use this feature."
   ),
   "DisengageOnAccelerator": tr_noop("When enabled, pressing the accelerator pedal will disengage openpilot."),
+  "MadsEnabled": tr_noop(
+    "Use the cruise main button to control steering independently from ACC. When the main switch is on, steering remains active while ACC is off."
+  ),
   "LongitudinalPersonality": tr_noop(
     "Standard is recommended. In aggressive mode, openpilot will follow lead cars closer and be more aggressive with the gas and brake. " +
     "In relaxed mode openpilot will stay further away from lead cars. On supported cars, you can cycle through these personalities with " +
@@ -59,6 +63,12 @@ class TogglesLayout(Widget):
         DESCRIPTIONS["DisengageOnAccelerator"],
         "disengage_on_accelerator.png",
         False,
+      ),
+      "MadsEnabled": (
+        lambda: tr("Modular Assistive Driving System (MADS)"),
+        DESCRIPTIONS["MadsEnabled"],
+        "chffr_wheel.png",
+        True,
       ),
       "IsLdwEnabled": (
         lambda: tr("Enable Lane Departure Warnings"),
@@ -168,6 +178,11 @@ class TogglesLayout(Widget):
     )
 
     if ui_state.CP is not None:
+      mads_supported = ui_state.CP.carFingerprint == HYUNDAI_CAR.HYUNDAI_SONATA
+      self._toggles["MadsEnabled"].action_item.set_enabled(mads_supported and not ui_state.engaged)
+      if not mads_supported:
+        self._toggles["MadsEnabled"].set_description(
+          tr("MADS is currently available only on the Hyundai Sonata platform."))
       if ui_state.has_longitudinal_control:
         self._toggles["ExperimentalMode"].action_item.set_enabled(True)
         self._toggles["ExperimentalMode"].set_description(e2e_description)

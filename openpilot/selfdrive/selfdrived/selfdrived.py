@@ -236,9 +236,7 @@ class SelfdriveD:
           self.events.add(EventName.pcmEnable)
 
       # Disable on rising edge of accelerator or brake. Also disable on brake when speed > 0
-      if (CS.gasPressed and not self.CS_prev.gasPressed and self.disengage_on_accelerator) or \
-        (CS.brakePressed and (not self.CS_prev.brakePressed or not CS.standstill)) or \
-        (CS.regenBraking and (not self.CS_prev.regenBraking or not CS.standstill)):
+      if self.should_disengage_on_pedal(CS):
         self.events.add(EventName.pedalPressed)
 
     # Create events for temperature, disk space, and memory
@@ -445,6 +443,12 @@ class SelfdriveD:
         self.params.put('LongitudinalPersonality', self.personality)
         self.events.add(EventName.personalityChanged)
 
+  def should_disengage_on_pedal(self, CS):
+    pedal_disengage = (CS.gasPressed and not self.CS_prev.gasPressed and self.disengage_on_accelerator) or \
+                       (CS.brakePressed and (not self.CS_prev.brakePressed or not CS.standstill)) or \
+                       (CS.regenBraking and (not self.CS_prev.regenBraking or not CS.standstill))
+    return pedal_disengage and not (self.mads_available and CS.cruiseState.available)
+
   def data_sample(self):
     _car_state = messaging.recv_one(self.car_state_sock)
     CS = _car_state.carState if _car_state else self.CS_prev
@@ -463,8 +467,11 @@ class SelfdriveD:
           self.sm.ignore_alive.append('wideRoadCameraState')
           self.sm.ignore_valid.append('wideRoadCameraState')
 
-        if REPLAY and any(ps.controlsAllowed for ps in self.sm['pandaStates']):
-          self.state_machine.state = State.enabled
+        if REPLAY:
+          if any(ps.controlsAllowed for ps in self.sm['pandaStates']):
+            self.state_machine.state = State.enabled
+          elif self.mads_available and any(ps.controlsAllowedLateral for ps in self.sm['pandaStates']):
+            self.state_machine.state = State.lateralEnabled
 
         self.initialized = True
         cloudlog.event(

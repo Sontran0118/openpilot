@@ -178,11 +178,6 @@ class TogglesLayout(Widget):
     )
 
     if ui_state.CP is not None:
-      mads_supported = ui_state.CP.carFingerprint == HYUNDAI_CAR.HYUNDAI_SONATA and ui_state.CP.pcmCruise
-      self._toggles["MadsEnabled"].action_item.set_enabled(mads_supported and not ui_state.engaged)
-      if not mads_supported:
-        self._toggles["MadsEnabled"].set_description(
-          tr("MADS is currently available only on the Hyundai Sonata platform."))
       if ui_state.has_longitudinal_control:
         self._toggles["ExperimentalMode"].action_item.set_enabled(True)
         self._toggles["ExperimentalMode"].set_description(e2e_description)
@@ -219,6 +214,14 @@ class TogglesLayout(Widget):
     for toggle_def in self._toggle_defs:
       if self._toggle_defs[toggle_def][3] and toggle_def not in self._locked_toggles:
         self._toggles[toggle_def].action_item.set_enabled(not ui_state.engaged)
+
+    if ui_state.CP is not None:
+      mads_supported = ui_state.CP.carFingerprint == HYUNDAI_CAR.HYUNDAI_SONATA and ui_state.CP.pcmCruise
+      mads_locked = "MadsEnabled" in self._locked_toggles
+      self._toggles["MadsEnabled"].action_item.set_enabled(mads_supported and not mads_locked and not ui_state.engaged)
+      if not mads_supported:
+        self._toggles["MadsEnabled"].set_description(
+          tr("MADS is currently available only on the Hyundai Sonata platform."))
 
   def _render(self, rect):
     self._scroller.render(rect)

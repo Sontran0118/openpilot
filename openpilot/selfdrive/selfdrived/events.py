@@ -423,6 +423,10 @@ EVENTS: dict[int, dict[str, Alert | AlertCallbackType]] = {
     ET.PERMANENT: NormalPermanentAlert("Big Model Loading", priority=Priority.LOW),
   },
 
+  EventName.bigModelLoaded: {
+    ET.PERMANENT: EngagementAlert(AudibleAlert.complete),
+  },
+
   EventName.lateralManeuver: {
     ET.WARNING: longitudinal_maneuver_alert,
     ET.PERMANENT: NormalPermanentAlert("Lateral Maneuver Mode"),

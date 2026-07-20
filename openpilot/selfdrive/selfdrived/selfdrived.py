@@ -66,6 +66,7 @@ class SelfdriveD:
     self.excessive_actuation_check = ExcessiveActuationCheck()
     self.excessive_actuation = self.params.get("Offroad_ExcessiveActuation") is not None
     self.big_model_loading = False
+    self.big_model_active = False
 
     # Setup sockets
     self.pm = messaging.PubMaster(['selfdriveState', 'onroadEvents'])
@@ -157,6 +158,10 @@ class SelfdriveD:
 
     if self.sm.frame % 100 == 0:
       self.big_model_loading = self.params.get_bool("UsbGpuLoading")
+      big_model_active = self.params.get_bool("UsbGpuActive")
+      if big_model_active and not self.big_model_active:
+        self.events.add(EventName.bigModelLoaded)
+      self.big_model_active = big_model_active
     if self.big_model_loading:
       self.events.add(EventName.bigModelLoading)
 

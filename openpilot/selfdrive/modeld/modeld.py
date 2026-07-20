@@ -192,6 +192,7 @@ def main(demo=False):
       wait_usbgpu_link()
       model = ModelState(vipc_client_main.width, vipc_client_main.height, True)
       model.warmup()
+      params.put_bool("UsbGpuActive", True)
     except Exception:
       cloudlog.exception("big model failed to load, falling back to small")
     params.put_bool("UsbGpuLoading", False)

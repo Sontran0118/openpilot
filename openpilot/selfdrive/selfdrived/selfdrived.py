@@ -523,7 +523,7 @@ class SelfdriveD:
     ss.engageable = not self.events.contains(ET.NO_ENTRY)
     ss.experimentalMode = self.experimental_mode
     ss.personality = self.personality
-    ss.madsEnabled = self.mads_available and self.enabled
+    ss.madsEnabled = self.mads_available and self.active
     ss.madsAvailable = self.mads_available
 
     ss.alertText1 = self.AM.current_alert.alert_text_1
@@ -549,7 +549,8 @@ class SelfdriveD:
     self.update_events(CS)
     if not self.CP.passive and self.initialized:
       lateral_only = self.mads_available and CS.cruiseState.available and not CS.cruiseState.enabled
-      self.enabled, self.active = self.state_machine.update(self.events, lateral_only=lateral_only)
+      mads_requested = self.mads_available and CS.cruiseState.available
+      self.enabled, self.active = self.state_machine.update(self.events, lateral_only=lateral_only, mads_requested=mads_requested)
     self.update_alerts(CS)
 
     self.publish_selfdriveState(CS)

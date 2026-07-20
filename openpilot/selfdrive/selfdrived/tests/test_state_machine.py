@@ -123,3 +123,31 @@ class TestStateMachine:
     self.events.clear()
     self.state_machine.update(self.events, lateral_only=True)
     assert self.state_machine.state == State.lateralEnabled
+
+  def test_mads_engages_after_no_entry_clears(self):
+    self.events.add(make_event([ET.NO_ENTRY]))
+    self.state_machine.update(self.events, lateral_only=True, mads_requested=True)
+    assert self.state_machine.state == State.disabled
+
+    self.events.clear()
+    self.state_machine.update(self.events, lateral_only=True, mads_requested=True)
+    assert self.state_machine.state == State.lateralEnabled
+
+  def test_mads_reengages_after_soft_disable_timeout(self):
+    self.state_machine.state = State.softDisabling
+    self.state_machine.soft_disable_timer = 0
+    self.events.add(make_event([ET.SOFT_DISABLE]))
+    self.state_machine.update(self.events, lateral_only=False, mads_requested=True)
+    assert self.state_machine.state == State.disabled
+
+    self.state_machine.update(self.events, lateral_only=False, mads_requested=True)
+    assert self.state_machine.state == State.disabled
+
+    self.events.clear()
+    self.state_machine.update(self.events, lateral_only=False, mads_requested=True)
+    assert self.state_machine.state == State.enabled
+
+  def test_mads_does_not_engage_during_immediate_disable(self):
+    self.events.add(make_event([ET.ENABLE, ET.IMMEDIATE_DISABLE]))
+    self.state_machine.update(self.events, lateral_only=True, mads_requested=True)
+    assert self.state_machine.state == State.disabled

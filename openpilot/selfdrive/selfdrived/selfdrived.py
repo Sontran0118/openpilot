@@ -98,6 +98,8 @@ class SelfdriveD:
     self.is_ldw_enabled = self.params.get_bool("IsLdwEnabled")
     self.disengage_on_accelerator = self.params.get_bool("DisengageOnAccelerator")
     self.mads_available = bool(self.CP.alternativeExperience & ALTERNATIVE_EXPERIENCE.ENABLE_MADS)
+    self.mads_main_requested = False
+    self.mads_lateral_only = False
 
     car_recognized = self.CP.brand != 'mock'
 
@@ -449,6 +451,13 @@ class SelfdriveD:
                        (CS.regenBraking and (not self.CS_prev.regenBraking or not CS.standstill))
     return pedal_disengage and not (self.mads_available and CS.cruiseState.available)
 
+  def update_mads_cruise_state(self, CS):
+    # Invalid CarState data must not look like a physical Main switch cycle and
+    # clear a latched MADS disengagement.
+    if CS.canValid:
+      self.mads_main_requested = self.mads_available and CS.cruiseState.available
+      self.mads_lateral_only = self.mads_main_requested and not CS.cruiseState.enabled
+
   def data_sample(self):
     _car_state = messaging.recv_one(self.car_state_sock)
     CS = _car_state.carState if _car_state else self.CS_prev
@@ -549,9 +558,9 @@ class SelfdriveD:
     CS = self.data_sample()
     self.update_events(CS)
     if not self.CP.passive and self.initialized:
-      lateral_only = self.mads_available and CS.cruiseState.available and not CS.cruiseState.enabled
-      mads_requested = self.mads_available and CS.cruiseState.available
-      self.enabled, self.active = self.state_machine.update(self.events, lateral_only=lateral_only, mads_requested=mads_requested)
+      self.update_mads_cruise_state(CS)
+      self.enabled, self.active = self.state_machine.update(self.events, lateral_only=self.mads_lateral_only,
+                                                            mads_requested=self.mads_main_requested)
     self.update_alerts(CS)
 
     self.publish_selfdriveState(CS)

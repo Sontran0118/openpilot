@@ -11,11 +11,24 @@
 #define SPI_BUF_SIZE 2048
 
 
-class PandaSpiHandle {
+// Common interface implemented by PandaSpiHandle (comma panda) and
+// PandaSerialHandle (DIY STM32F446 panda over ST-Link VCP serial).
+class PandaCommsHandle {
 public:
   std::string hw_serial;
   std::atomic<bool> connected = true;
   std::atomic<bool> comms_healthy = true;
+
+  virtual ~PandaCommsHandle() {}
+  virtual int control_write(uint8_t request, uint16_t param1, uint16_t param2, unsigned int timeout=TIMEOUT) = 0;
+  virtual int control_read(uint8_t request, uint16_t param1, uint16_t param2, unsigned char *data, uint16_t length, unsigned int timeout=TIMEOUT) = 0;
+  virtual int bulk_write(unsigned char endpoint, unsigned char* data, int length, unsigned int timeout=TIMEOUT) = 0;
+  virtual int bulk_read(unsigned char endpoint, unsigned char* data, int length, unsigned int timeout=TIMEOUT) = 0;
+  virtual void cleanup() = 0;
+};
+
+class PandaSpiHandle : public PandaCommsHandle {
+public:
 
   PandaSpiHandle(std::string serial);
   ~PandaSpiHandle();
@@ -49,4 +62,26 @@ private:
 
   spi_header header;
   uint32_t xfer_count = 0;
+};
+
+
+// PandaSerialHandle - DIY STM32F446 panda over UART (ST-Link VCP).
+// Framing matches the firmware's board/drivers/serial_comms.h.
+class PandaSerialHandle : public PandaCommsHandle {
+public:
+  PandaSerialHandle(std::string serial);
+  ~PandaSerialHandle();
+
+  int control_write(uint8_t request, uint16_t param1, uint16_t param2, unsigned int timeout=TIMEOUT) override;
+  int control_read(uint8_t request, uint16_t param1, uint16_t param2, unsigned char *data, uint16_t length, unsigned int timeout=TIMEOUT) override;
+  int bulk_write(unsigned char endpoint, unsigned char* data, int length, unsigned int timeout=TIMEOUT) override;
+  int bulk_read(unsigned char endpoint, unsigned char* data, int length, unsigned int timeout=TIMEOUT) override;
+  void cleanup() override;
+
+  static std::vector<std::string> list();
+
+private:
+  int fd = -1;
+  inline static std::recursive_mutex hw_lock;
+  int transfer(uint8_t endpoint, uint8_t *tx, uint16_t tx_len, uint8_t *rx, uint16_t max_rx, unsigned int timeout);
 };

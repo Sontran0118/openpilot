@@ -13,8 +13,14 @@
 const bool PANDAD_MAXOUT = getenv("PANDAD_MAXOUT") != nullptr;
 
 Panda::Panda(std::string serial) {
-  handle = std::make_unique<PandaSpiHandle>(serial);
-  LOGW("connected to %s over SPI", serial.c_str());
+  // DIY F446 panda talks over a serial VCP (/dev/ttyACM*); comma pandas use SPI.
+  if (serial.rfind("/dev/tty", 0) == 0) {
+    handle = std::make_unique<PandaSerialHandle>(serial);
+    LOGW("connected to %s over SERIAL", serial.c_str());
+  } else {
+    handle = std::make_unique<PandaSpiHandle>(serial);
+    LOGW("connected to %s over SPI", serial.c_str());
+  }
 
   hw_type = get_hw_type();
   can_reset_communications();
@@ -33,7 +39,10 @@ std::string Panda::hw_serial() {
 }
 
 std::vector<std::string> Panda::list() {
-  return PandaSpiHandle::list();
+  std::vector<std::string> ret = PandaSpiHandle::list();
+  std::vector<std::string> ser = PandaSerialHandle::list();
+  ret.insert(ret.end(), ser.begin(), ser.end());
+  return ret;
 }
 
 void Panda::set_safety_model(cereal::CarParams::SafetyModel safety_model, uint16_t safety_param) {

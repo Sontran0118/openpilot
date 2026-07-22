@@ -185,7 +185,9 @@
 //   #include "stm32f412rx.h"
 // #elif defined(STM32F412Vx)
 //   #include "stm32f412vx.h"
-#if defined(STM32F413xx)
+#if defined(STM32F446xx)
+  #include "stm32f446xx.h"
+#elif defined(STM32F413xx)
   #include "stm32f413xx.h"
  #elif defined(STM32F423xx)
   #include "stm32f423xx.h"

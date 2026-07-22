@@ -1,12 +1,14 @@
+#ifndef STM32F446xx
 #define STM32F446xx
+#endif
 #include "stm32f4xx.h"
 #include "stm32f4xx_hal_gpio_ex.h"
-#define MCU_IDCODE 0x463U
+#define MCU_IDCODE 0x421U   // STM32F446 (F413 was 0x463)
 
-#define CORE_FREQ 96U // in MHz
-#define APB1_FREQ (CORE_FREQ/2U)
+#define CORE_FREQ 180U // in MHz - see stm32f446/clock.h (PLLM=8,PLLN=360,PLLP=2)
+#define APB1_FREQ (CORE_FREQ/4U)        // PPRE1 = /4 -> 45 MHz (APB1 max)
 #define APB1_TIMER_FREQ (APB1_FREQ*2U)  // APB1 is multiplied by 2 for the timer peripherals
-#define APB2_FREQ (CORE_FREQ/2U)
+#define APB2_FREQ (CORE_FREQ/2U)        // PPRE2 = /2 -> 90 MHz (APB2 max)
 #define APB2_TIMER_FREQ (APB2_FREQ*2U)  // APB2 is multiplied by 2 for the timer peripherals
 
 #define BOOTLOADER_ADDRESS 0x1FFF0004U
@@ -48,24 +50,24 @@
 #include "board/drivers/registers.h"
 #include "board/drivers/interrupts.h"
 #include "board/drivers/gpio.h"
-#include "board/stm32f4/peripherals.h"
-#include "board/stm32f4/interrupt_handlers.h"
+#include "board/stm32f446/peripherals.h"
+#include "board/stm32f446/interrupt_handlers.h"
 #include "board/drivers/timers.h"
-#include "board/stm32f4/board.h"
-#include "board/stm32f4/clock.h"
+#include "board/stm32f446/board.h"
+#include "board/stm32f446/clock.h"
 
 #if !defined(BOOTSTUB)
   #include "board/drivers/uart.h"
-  #include "board/stm32f4/lluart.h"
+  #include "board/stm32f446/lluart.h"
 #endif
 
 #ifdef BOOTSTUB
-  #include "board/stm32f4/llflash.h"
+  #include "board/stm32f446/llflash.h"
 #else
-  #include "board/stm32f4/llbxcan.h"
+  #include "board/stm32f446/llbxcan.h"
 #endif
 
-#include "board/stm32f4/llusb.h"
+#include "board/stm32f446/llusb.h"
 
 // unused
 void spi_init(void) {};

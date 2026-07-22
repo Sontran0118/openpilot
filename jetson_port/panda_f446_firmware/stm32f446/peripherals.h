@@ -35,6 +35,9 @@ void common_init_gpio(void) {
 
 // USART2 baud config (APB1 = 45 MHz). panda uses 115200 for debug; the serial link runs faster.
 // For the VCP link we use 1.5 Mbaud to keep CAN throughput. ST-Link VCP supports up to ~2 Mbaud.
+#ifndef SERIAL_UART
+#define SERIAL_UART USART2
+#endif
 #define SERIAL_BAUD 1500000U
 
 void usart2_init(void) {
@@ -72,7 +75,29 @@ void peripherals_init(void) {
 }
 
 // panda calls this to (re)bring the debug/comms uart. We route it to USART2.
-void uart_init(USART_TypeDef *u, int baud) {
+void f446_uart_init(USART_TypeDef *u, int baud) {
   UNUSED(u); UNUSED(baud);
   usart2_init();
+}
+
+// --- ported from stm32f4/peripherals.h (F446-compatible) ---
+void enable_interrupt_timer(void) {
+  register_set_bits(&(RCC->APB1ENR), RCC_APB1ENR_TIM6EN);  // Enable interrupt timer peripheral
+}
+
+void flasher_peripherals_init(void) {
+  RCC->AHB1ENR |= RCC_AHB1ENR_DMA2EN;
+  RCC->APB2ENR |= RCC_APB2ENR_SPI1EN;
+  RCC->AHB2ENR |= RCC_AHB2ENR_OTGFSEN;
+  RCC->APB1ENR |= RCC_APB1ENR_USART2EN;
+}
+
+void gpio_spi_init(void) {
+}
+
+void gpio_usb_init(void) {
+  // A11,A12: USB
+  set_gpio_alternate(GPIOA, 11, GPIO_AF10_OTG_FS);
+  set_gpio_alternate(GPIOA, 12, GPIO_AF10_OTG_FS);
+  GPIOA->OSPEEDR = GPIO_OSPEEDER_OSPEEDR11 | GPIO_OSPEEDER_OSPEEDR12;
 }

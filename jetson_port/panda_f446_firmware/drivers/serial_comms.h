@@ -32,24 +32,31 @@ extern bool uart_recv_raw(uint8_t *d, uint16_t len, uint32_t timeout_ms);
 
 // process exactly one request/response transaction. Called from the main loop.
 void serial_comms_tick(void) {
-  // 1) read header (7 bytes)
-  if (!uart_recv_raw(ser_rx, SERIAL_HEADER_SIZE, 5U)) { return; }
-  if (ser_rx[0] != SERIAL_SYNC_BYTE) { return; }
+  // 1) hunt for the SYNC byte one byte at a time. Never consume a fixed block
+  //    before we are aligned, or a single dropped/extra byte desyncs forever.
+  if (!uart_recv_byte(&ser_rx[0], 2U)) { return; }
+  if (ser_rx[0] != SERIAL_SYNC_BYTE) { return; }   // not aligned: drop 1 byte, retry next tick
+
+  // read the remaining 6 header bytes; on timeout flush and resync
+  if (!uart_recv_raw(&ser_rx[1], SERIAL_HEADER_SIZE - 1U, 20U)) { uart_flush_rx(); return; }
   if (serial_checksum(ser_rx, SERIAL_HEADER_SIZE) != 0U) {
+    uart_flush_rx();
     uint8_t nack = SERIAL_NACK; uart_send_raw(&nack, 1U); return;
   }
   uint8_t  endpoint  = ser_rx[1];
   uint16_t mosi_len  = (uint16_t)ser_rx[2] | ((uint16_t)ser_rx[3] << 8);
   uint16_t miso_len  = (uint16_t)ser_rx[4] | ((uint16_t)ser_rx[5] << 8);
   if (mosi_len > (SERIAL_BUF_SIZE - SERIAL_HEADER_SIZE - 1U)) {
+    uart_flush_rx();
     uint8_t nack = SERIAL_NACK; uart_send_raw(&nack, 1U); return;
   }
 
   // 2) ack header, then read mosi data (if any) + its checksum byte
   uint8_t hack = SERIAL_HACK; uart_send_raw(&hack, 1U);
   if (mosi_len > 0U) {
-    if (!uart_recv_raw(&ser_rx[SERIAL_HEADER_SIZE], mosi_len + 1U, 20U)) { return; }
+    if (!uart_recv_raw(&ser_rx[SERIAL_HEADER_SIZE], mosi_len + 1U, 50U)) { uart_flush_rx(); return; }
     if (serial_checksum(&ser_rx[SERIAL_HEADER_SIZE], mosi_len + 1U) != 0U) {
+      uart_flush_rx();
       uint8_t nack = SERIAL_NACK; uart_send_raw(&nack, 1U); return;
     }
   }
@@ -86,5 +93,7 @@ void serial_comms_tick(void) {
 }
 
 void serial_comms_init(void) {
-  // uart peripheral is brought up in peripherals.h / lluart; nothing else needed here.
+  // bring up USART2 (PA2/PA3 -> ST-Link VCP) and clear any junk in the RX path
+  usart2_init();
+  uart_flush_rx();
 }

@@ -2,7 +2,7 @@ Import('env', 'arch', 'common', 'messaging')
 
 if arch != "Darwin":
   libs = [common, messaging, 'pthread']
-  panda = env.Library('panda', ['panda.cc', 'spi.cc'])
+  panda = env.Library('panda', ['panda.cc', 'spi.cc', 'serial.cc'])
 
   env.Program('pandad', ['main.cc', 'pandad.cc', 'panda_safety.cc'], LIBS=[panda] + libs)
 

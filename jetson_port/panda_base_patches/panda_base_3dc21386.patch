@@ -1,0 +1,173 @@
+diff --git a/SConscript b/SConscript
+index 0fe6723f..0f896780 100644
+--- a/SConscript
++++ b/SConscript
+@@ -90,7 +90,7 @@ def build_project(project_name, project, main, extra_flags):
+     CFLAGS=flags,
+     ASFLAGS=flags,
+     LINKFLAGS=flags,
+-    CPPPATH=[Dir("./"), "./board/stm32f4/inc", "./board/stm32h7/inc", opendbc.INCLUDE_PATH],
++    CPPPATH=[Dir("./"), "./board/stm32f4/inc", "./board/stm32h7/inc", "/home/tran/opendbc_src"],
+     ASCOM="$AS $ASFLAGS -o $TARGET -c $SOURCES",
+     BUILDERS={
+       'Objcopy': Builder(generator=objcopy, suffix='.bin', src_suffix='.elf')
+@@ -167,6 +167,24 @@ with open("board/obj/cert.h", "w") as f:
+ build_project("panda", base_project_f4, "./board/main.c", [])
+ build_project("panda_h7", base_project_h7, "./board/main.c", [])
+ 
++
++base_project_f446 = {
++  "STARTUP_FILE": "./board/stm32f446/startup_stm32f446xx.s",
++  "LINKER_SCRIPT": "./board/stm32f446/stm32f446_flash.ld",
++  "APP_START_ADDRESS": "0x8004000",
++  "FLAGS": [
++    "-mcpu=cortex-m4",
++    "-mhard-float",
++    "-DSTM32F4",
++    "-DSTM32F446xx",
++    "-DPANDA_NUCLEO",
++    "-Iboard/stm32f446/inc",
++    "-mfpu=fpv4-sp-d16",
++  ],
++}
++
++build_project("panda_f446", base_project_f446, "./board/main.c", [])
++
+ # panda jungle fw
+ flags = [
+   "-DPANDA_JUNGLE",
+diff --git a/board/config.h b/board/config.h
+index 94ef5490..6b6bda07 100644
+--- a/board/config.h
++++ b/board/config.h
+@@ -35,6 +35,8 @@
+ // platform includes
+ #ifdef STM32H7
+   #include "board/stm32h7/stm32h7_config.h"
++#elif defined(STM32F446xx)
++  #include "board/stm32f446/stm32f4_config.h"
+ #elif defined(STM32F4)
+   #include "board/stm32f4/stm32f4_config.h"
+ #else
+diff --git a/board/drivers/bxcan.h b/board/drivers/bxcan.h
+index 75bd05d5..ba0d66b4 100644
+--- a/board/drivers/bxcan.h
++++ b/board/drivers/bxcan.h
+@@ -1,5 +1,14 @@
+ #include "bxcan_declarations.h"
+ 
++#ifdef STM32F446xx
++// F446 has only CAN1/CAN2. Keep CAN_ARRAY_SIZE at 3 but alias the third
++// slot to CAN2; board_nucleo declares 2 buses so slot 3 is never used.
++#define CAN3 CAN2
++#define CAN3_TX_IRQn CAN2_TX_IRQn
++#define CAN3_RX0_IRQn CAN2_RX0_IRQn
++#define CAN3_SCE_IRQn CAN2_SCE_IRQn
++#endif
++
+ // IRQs: CAN1_TX, CAN1_RX0, CAN1_SCE
+ //       CAN2_TX, CAN2_RX0, CAN2_SCE
+ //       CAN3_TX, CAN3_RX0, CAN3_SCE
+diff --git a/board/drivers/can_common.h b/board/drivers/can_common.h
+index 23e0c1a4..de7132d3 100644
+--- a/board/drivers/can_common.h
++++ b/board/drivers/can_common.h
+@@ -22,8 +22,16 @@ bool can_loopback = false;
+   extern can_ring can_##x; \
+   can_ring can_##x = { .w_ptr = 0, .r_ptr = 0, .fifo_size = (size), .elems = (CANPacket_t *)&(elems_##x) };
+ 
++#ifdef STM32F446xx
++#define CAN_RX_BUFFER_SIZE 1024U   // 128K RAM: 4096 does not fit
++#else
+ #define CAN_RX_BUFFER_SIZE 4096U
++#endif
++#ifdef STM32F446xx
++#define CAN_TX_BUFFER_SIZE 128U
++#else
+ #define CAN_TX_BUFFER_SIZE 416U
++#endif
+ 
+ #ifdef STM32H7
+ // ITCM RAM and DTCM RAM are the fastest for Cortex-M7 core access
+diff --git a/board/drivers/harness.h b/board/drivers/harness.h
+index 3ebf109f..1203f97c 100644
+--- a/board/drivers/harness.h
++++ b/board/drivers/harness.h
+@@ -99,7 +99,12 @@ void harness_init(void) {
+   set_gpio_output(current_board->harness_config->GPIO_relay_SBU2, current_board->harness_config->pin_relay_SBU2, 1);
+ 
+   // detect initial orientation
++#ifdef PANDA_NUCLEO
++  // Nucleo has no harness/SBU ADC hardware - ADC would spin forever
++  harness.status = HARNESS_STATUS_NC;
++#else
+   harness.status = harness_detect_orientation();
++#endif
+ 
+   // keep buses connected by default
+   set_intercept_relay(false, false);
+diff --git a/board/drivers/registers_declarations.h b/board/drivers/registers_declarations.h
+index 90ee66df..bc7ba13d 100644
+--- a/board/drivers/registers_declarations.h
++++ b/board/drivers/registers_declarations.h
+@@ -8,7 +8,11 @@ typedef struct reg {
+ } reg;
+ 
+ // 10 bit hash with 23 as a prime
++#ifdef STM32F446xx
++#define REGISTER_MAP_SIZE 0xFFU   // 128K RAM (mask: must be 2^n-1)
++#else
+ #define REGISTER_MAP_SIZE 0x3FFU
++#endif
+ #define HASHING_PRIME 23U
+ #define CHECK_COLLISION(hash, addr) (((uint32_t) register_map[hash].address != 0U) && (register_map[hash].address != (addr)))
+ 
+diff --git a/board/main.c b/board/main.c
+index dbc6e343..ca25a945 100644
+--- a/board/main.c
++++ b/board/main.c
+@@ -28,6 +28,10 @@
+ 
+ #include "board/can_comms.h"
+ #include "board/main_comms.h"
++#ifdef PANDA_NUCLEO
++#include "board/drivers/serial_uart_raw.h"
++#include "board/drivers/serial_comms.h"
++#endif
+ 
+ 
+ // ********************* Serial debugging *********************
+@@ -326,7 +330,12 @@ int main(void) {
+   print("DEBUG ENABLED\n");
+ #endif
+   // enable USB (right before interrupts or enum can fail!)
++#ifdef PANDA_NUCLEO
++  // Nucleo: no usable USB peripheral - panda protocol runs over USART2 (ST-Link VCP)
++  serial_comms_init();
++#else
+   usb_init();
++#endif
+ 
+   if (current_board->has_spi) {
+     gpio_spi_init();
+@@ -342,6 +351,20 @@ int main(void) {
+ 
+   // LED should keep on blinking all the time
+   while (true) {
++#ifdef PANDA_NUCLEO
++    // Polled UART transport: service comms as fast as possible. The stock LED
++    // fade below blocks for seconds, which would starve the serial link
++    // (USB pandas do comms in interrupts, so the fade is harmless there).
++    serial_comms_tick();
++    if (power_save_status == POWER_SAVE_STATUS_DISABLED) {
++      static uint32_t nucleo_blink = 0U;
++      nucleo_blink++;
++      if ((nucleo_blink & 0x3FFFFU) == 0U) {
++        led_set(LED_RED, (nucleo_blink & 0x40000U) != 0U);
++      }
++    }
++    continue;
++#endif
+     if (power_save_status == POWER_SAVE_STATUS_DISABLED) {
+       #ifdef DEBUG_FAULTS
+       if (fault_status == FAULT_STATUS_NONE) {

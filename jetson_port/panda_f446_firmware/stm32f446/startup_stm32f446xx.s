@@ -60,8 +60,8 @@ defined in linker script */
 Reset_Handler:  
   ldr   sp, =_estack      /* set stack pointer */
   
-/* Call the clock system initialization function.*/
-  bl  SystemInit  
+/* panda: early hardware init (replaces ST SystemInit) */
+  bl  __initialize_hardware_early
 
 /* Copy the data segment initializers from flash to SRAM */  
   ldr r0, =_sdata
@@ -94,8 +94,7 @@ LoopFillZerobss:
   cmp r2, r4
   bcc FillZerobss
   
-/* Call static constructors */
-    bl __libc_init_array
+/* panda: -nostdlib, no static constructors */
 /* Call the application's entry point.*/
   bl  main
   bx  lr    

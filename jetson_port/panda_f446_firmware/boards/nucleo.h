@@ -40,7 +40,16 @@ static void nucleo_init_bootloader(void) { }
 
 // no harness relay on the Nucleo
 static harness_configuration nucleo_harness_config = {
-  .has_harness = false,
+  .GPIO_SBU1 = GPIOC,
+  .GPIO_SBU2 = GPIOC,
+  .GPIO_relay_SBU1 = GPIOC,
+  .GPIO_relay_SBU2 = GPIOC,
+  .pin_SBU1 = 0U,
+  .pin_SBU2 = 1U,
+  .pin_relay_SBU1 = 10U,
+  .pin_relay_SBU2 = 11U,
+  .adc_signal_SBU1 = ADC_CHANNEL_DEFAULT(ADC1, 10),
+  .adc_signal_SBU2 = ADC_CHANNEL_DEFAULT(ADC1, 11),
 };
 
 struct board board_nucleo = {

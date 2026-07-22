@@ -4,7 +4,9 @@
 //
 // microsecond timing uses the panda's microsecond_timer (TIM). We poll SR flags.
 
+#ifndef SERIAL_UART
 #define SERIAL_UART USART2
+#endif
 
 // millisecond deadline helper using the panda's microsecond_timer (already used elsewhere)
 static bool uart_wait_flag(volatile uint32_t *sr, uint32_t flag, uint32_t timeout_ms) {
@@ -30,4 +32,25 @@ bool uart_recv_raw(uint8_t *d, uint16_t len, uint32_t timeout_ms) {
     d[i] = (uint8_t)(SERIAL_UART->DR & 0xFFU);
   }
   return true;
+}
+
+// Read a single byte with timeout. Returns false on timeout (nothing consumed).
+static bool uart_recv_byte(uint8_t *b, uint32_t timeout_ms) {
+  if (!uart_wait_flag(&SERIAL_UART->SR, USART_SR_RXNE, timeout_ms)) { return false; }
+  *b = (uint8_t)(SERIAL_UART->DR & 0xFFU);
+  return true;
+}
+
+// Drain anything sitting in the RX register (used to resync after a bad frame).
+static void uart_flush_rx(void) {
+  uint32_t guard = 0U;
+  while (((SERIAL_UART->SR & USART_SR_RXNE) != 0U) && (guard < 4096U)) {
+    (void)SERIAL_UART->DR;
+    guard++;
+  }
+  // clear ORE/FE/NE/PE: read SR then DR
+  if ((SERIAL_UART->SR & (USART_SR_ORE | USART_SR_FE | USART_SR_NE | USART_SR_PE)) != 0U) {
+    (void)SERIAL_UART->SR;
+    (void)SERIAL_UART->DR;
+  }
 }

@@ -1,0 +1,117 @@
+#!/usr/bin/env python3
+"""FULL CHAIN, live: IMX477 -> supercombo -> proper curvature -> modelV2 on bus
+-> controlsd -> steering command. Everything real, nothing transmitted to the car.
+
+This is the complete openpilot lateral pipeline running on the Jetson for the CX-5.
+Usage: python3 full_chain.py [--synthetic] [-n N]
+"""
+import sys, os, time, math
+os.environ.setdefault("PARAMS_ROOT", "/tmp/op_params")
+sys.path.insert(0, "/home/tran/openpilot_jetson")
+
+import numpy as np
+import openpilot.cereal.messaging as messaging
+from curvature_lib import path_to_curvature, T_IDXS
+from opendbc.car.mazda.values import CAR
+from opendbc.car.mazda.interface import CarInterface
+from openpilot.common.params import Params
+from cereal import log
+from opendbc.car.structs import car as car_struct
+
+# --- car params ---
+CP = CarInterface.get_non_essential_params(CAR.MAZDA_CX5_2022)
+Params().put("CarParams", CP.to_bytes())
+from openpilot.selfdrive.controls.controlsd import Controls
+
+synthetic = "--synthetic" in sys.argv
+n = 5
+if "-n" in sys.argv:
+    n = int(sys.argv[sys.argv.index("-n")+1])
+
+runner = None
+if not synthetic:
+    from op_stream import SupercomboRunner
+    runner = SupercomboRunner()
+    print("supercombo loaded — FULL LIVE CHAIN")
+else:
+    print("synthetic mode")
+
+# publishers for ALL controlsd inputs
+topics = ['liveDelay','liveParameters','liveTorqueParameters','modelV2','selfdriveState',
+          'liveCalibration','livePose','longitudinalPlan','lateralManeuverPlan',
+          'carState','carOutput','driverMonitoringState','onroadEvents','driverAssistance']
+pm = messaging.PubMaster(topics)
+controls = Controls()
+time.sleep(0.5)
+
+V = 20.0
+frame_id = 0
+
+def grab():
+    import subprocess, cv2
+    subprocess.run(["gst-launch-1.0","-q","nvarguscamerasrc","num-buffers=1","!",
+        "video/x-raw(memory:NVMM),width=1280,height=720","!","nvvidconv","!","jpegenc","!",
+        "filesink","location=/tmp/vf.jpg"], capture_output=True, timeout=15)
+    return cv2.imread("/tmp/vf.jpg")
+
+def publish_all(out, curv):
+    global frame_id
+    def send(name, fn):
+        if name == "onroadEvents":
+            m = messaging.new_message(name, 0)
+        else:
+            m = messaging.new_message(name); fn(getattr(m, name))
+        pm.send(name, m)
+
+    def cs(x):
+        x.vEgo=V; x.vEgoRaw=V; x.steeringAngleDeg=0.0; x.steeringPressed=False
+        x.gearShifter=car_struct.CarState.GearShifter.drive
+        x.cruiseState.enabled=True; x.cruiseState.available=True
+    def lp(x):
+        x.steerRatio=15.5; x.stiffnessFactor=1.0; x.angleOffsetDeg=0.0; x.roll=0.0; x.valid=True
+    def tp(x):
+        x.useParams=True; x.latAccelFactorFiltered=2.5; x.latAccelOffsetFiltered=0.0; x.frictionCoefficientFiltered=0.1
+    def ss(x):
+        x.enabled=True; x.active=True; x.state=log.SelfdriveState.OpenpilotState.enabled
+    def lc(x):
+        x.rpyCalib=[0.0,0.0,0.0]
+    def mv(md):
+        global frame_id
+        md.frameId=frame_id; frame_id+=1
+        path=out.get("path_xyz")
+        if path is not None:
+            md.position.x=[float(path[i][0]) for i in range(33)]
+            md.position.y=[float(path[i][1]) for i in range(33)]
+            md.position.z=[float(path[i][2]) for i in range(33)]
+            md.position.t=[float(t) for t in T_IDXS]
+        try: md.action.desiredCurvature=float(curv)
+        except Exception: pass
+
+    send('carState', cs); send('liveParameters', lp); send('liveTorqueParameters', tp)
+    send('selfdriveState', ss); send('liveCalibration', lc); send('modelV2', mv)
+    for t in ('liveDelay','livePose','longitudinalPlan','lateralManeuverPlan',
+              'carOutput','driverMonitoringState','onroadEvents','driverAssistance'):
+        send(t, lambda x: None)
+
+print("\n%-6s %-12s %-12s %s" % ("frame","path_x_end","curvature","steer_torque"))
+print("-"*52)
+for i in range(n):
+    if synthetic:
+        out = {"path_xyz": np.array([[j*V*0.1, 0.002*j*j, 0.0] for j in range(33)])}
+    else:
+        f = grab()
+        if f is None: print("no frame"); continue
+        out = runner.step(f)
+
+    curv = path_to_curvature(out.get("path_xyz"), V)
+
+    for _ in range(4):
+        publish_all(out, curv)
+        time.sleep(0.03)
+        controls.sm.update(10)
+
+    CC, lac_log = controls.state_control()
+    px_end = float(out["path_xyz"][-1][0])
+    print("%-6d %-12.2f %-12.5f %.4f" % (i, px_end, curv, CC.actuators.torque))
+
+print("\n=== FULL LIVE CHAIN: camera -> supercombo -> curvature -> controlsd -> torque ===")

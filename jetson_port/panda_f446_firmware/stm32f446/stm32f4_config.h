@@ -14,7 +14,7 @@
 #define BOOTLOADER_ADDRESS 0x1FFF0004U
 
 // Around (1Mbps / 8 bits/byte / 12 bytes per message)
-#define CAN_INTERRUPT_RATE 12000U
+#define CAN_INTERRUPT_RATE 60000U   // F446+Mazda: filtered bus bursts well past the F413-era 12000
 
 #define MAX_LED_FADE 8192U
 
@@ -34,6 +34,7 @@
 #define DEVICE_SERIAL_NUMBER_ADDRESS 0x1FFF79C0U
 
 #include "board/can.h"
+#include "board/vehicle_state.h"
 #include "board/comms_definitions.h"
 
 #ifndef BOOTSTUB

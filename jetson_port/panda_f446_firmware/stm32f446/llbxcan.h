@@ -7,6 +7,17 @@ const uint32_t data_speeds[DATA_SPEEDS_ARRAY_SIZE] = {0U}; // No separate data s
 bool llcan_set_speed(CAN_TypeDef *CANx, uint32_t speed, bool loopback, bool silent) {
   bool ret = true;
 
+  // wake the peripheral: bxCAN resets into SLEEP mode and will not receive
+  // anything while SLAK is set.
+  register_clear_bits(&(CANx->MCR), CAN_MCR_SLEEP);
+  {
+    uint32_t wake_to = 0U;
+    while (((CANx->MSR & CAN_MSR_SLAK) == CAN_MSR_SLAK) && (wake_to < CAN_INIT_TIMEOUT_MS)) {
+      delay(10000);
+      wake_to++;
+    }
+  }
+
   // initialization mode
   register_set(&(CANx->MCR), CAN_MCR_TTCM | CAN_MCR_INRQ, 0x180FFU);
   uint32_t timeout_counter = 0U;
@@ -37,7 +48,7 @@ bool llcan_set_speed(CAN_TypeDef *CANx, uint32_t speed, bool loopback, bool sile
       register_set_bits(&(CANx->BTR), CAN_BTR_SILM);
     }
 
-    // reset
+    // leave init mode; keep SLEEP clear (ABOM = auto bus-off recovery)
     register_set(&(CANx->MCR), CAN_MCR_TTCM | CAN_MCR_ABOM, 0x180FFU);
 
     timeout_counter = 0U;
@@ -104,6 +115,50 @@ bool llcan_init(CAN_TypeDef *CANx) {
   }
 
   if(ret){
+#ifdef MAZDA_FILTER
+    // ---- Hardware acceptance filter: only the IDs opendbc's Mazda port uses ----
+    // The CX-5 bus carries ~743 distinct IDs at ~2-3k frames/s, which saturates
+    // the 1.5 Mbaud serial link and overflows can_rx_q (observed 1.29M drops).
+    // Filtering in hardware cuts that to the 17 messages carstate.py reads.
+    //
+    // 16-bit LIST mode: each 32-bit register holds TWO 11-bit IDs at bits 15:5.
+    // 5 banks x 4 IDs = 20 slots; we use 17 (pad with a repeat of the first).
+    static const uint16_t mazda_ids[20] = {
+      0x078U, // BRAKE
+      0x082U, // STEER
+      0x09AU, // BLINK_INFO
+      0x09DU, // CRZ_BTNS
+      0x165U, // PEDALS
+      0x202U, // ENGINE_DATA
+      0x215U, // WHEEL_SPEEDS
+      0x21CU, // CRZ_CTRL
+      0x21FU, // CRZ_EVENTS
+      0x228U, // GEAR
+      0x240U, // STEER_TORQUE
+      0x241U, // STEER_RATE
+      0x243U, // CAM_LKAS
+      0x340U, // SEATBELT
+      0x43EU, // DOORS
+      0x440U, // CAM_LANEINFO
+      0x477U, // BSM
+      0x078U, 0x078U, 0x078U  // padding (harmless duplicates)
+    };
+
+    // 16-bit scale (FS1R bit clear) + LIST mode (FM1R bit set) for banks 0..4
+    CANx->FS1R &= ~0x1FU;
+    CANx->FM1R |= 0x1FU;
+
+    for (uint8_t bank = 0U; bank < 5U; bank++) {
+      const uint16_t a = mazda_ids[(bank * 4U) + 0U];
+      const uint16_t b = mazda_ids[(bank * 4U) + 1U];
+      const uint16_t c = mazda_ids[(bank * 4U) + 2U];
+      const uint16_t d = mazda_ids[(bank * 4U) + 3U];
+      // STID occupies bits 15:5 of each 16-bit half
+      CANx->sFilterRegister[bank].FR1 = ((uint32_t)(b << 5) << 16) | (uint32_t)(a << 5);
+      CANx->sFilterRegister[bank].FR2 = ((uint32_t)(d << 5) << 16) | (uint32_t)(c << 5);
+    }
+    CANx->FA1R |= 0x1FU;   // activate banks 0-4
+#else
     // no mask
     // For some weird reason some of these registers do not want to set properly on CAN2 and CAN3. Probably something to do with the single/dual mode and their different filters.
     CANx->sFilterRegister[0].FR1 = 0U;
@@ -111,6 +166,7 @@ bool llcan_init(CAN_TypeDef *CANx) {
     CANx->sFilterRegister[14].FR1 = 0U;
     CANx->sFilterRegister[14].FR2 = 0U;
     CANx->FA1R |= 1U | (1UL << 14);
+#endif
 
     // Exit init mode, do not wait
     register_clear_bits(&(CANx->FMR), CAN_FMR_FINIT);

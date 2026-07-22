@@ -12,6 +12,13 @@
 static bool uart_wait_flag(volatile uint32_t *sr, uint32_t flag, uint32_t timeout_ms) {
   uint32_t start = microsecond_timer_get();
   while ((*sr & flag) == 0U) {
+    // ORE recovery: once the overrun flag latches, the USART stops asserting
+    // RXNE entirely. It is cleared by a read of SR followed by a read of DR.
+    // Without this the receive path wedges permanently after one overrun.
+    if ((*sr & (USART_SR_ORE | USART_SR_NE | USART_SR_FE | USART_SR_PE)) != 0U) {
+      (void)*sr;
+      (void)SERIAL_UART->DR;
+    }
     if ((microsecond_timer_get() - start) > (timeout_ms * 1000U)) { return false; }
   }
   return true;
@@ -48,9 +55,7 @@ static void uart_flush_rx(void) {
     (void)SERIAL_UART->DR;
     guard++;
   }
-  // clear ORE/FE/NE/PE: read SR then DR
-  if ((SERIAL_UART->SR & (USART_SR_ORE | USART_SR_FE | USART_SR_NE | USART_SR_PE)) != 0U) {
-    (void)SERIAL_UART->SR;
-    (void)SERIAL_UART->DR;
-  }
+  // clear ORE/FE/NE/PE unconditionally: read SR then DR
+  (void)SERIAL_UART->SR;
+  (void)SERIAL_UART->DR;
 }

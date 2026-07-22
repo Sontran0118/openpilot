@@ -1,12 +1,12 @@
 #pragma once
 
 // SAE 2284-3 : minimum 16 tq, SJW 3, sample point at 81.3%
-#define CAN_QUANTA 16U
+#define CAN_QUANTA 15U   // must equal 1+SEQ1+SEQ2
 #define CAN_SEQ1 12U
-#define CAN_SEQ2 3U
-#define CAN_SJW  3U
+#define CAN_SEQ2 2U   // F446: 15 tq @45MHz -> exactly 500 kbps (86.7% sample)
+#define CAN_SJW  2U   // <= SEQ2
 
-#define CAN_PCLK 48000U
+#define CAN_PCLK 45000U   // F446: APB1 = 180/4 = 45 MHz (F413 was 48)
 // 333 = 33.3 kbps
 // 5000 = 500 kbps
 #define can_speed_to_prescaler(x) (CAN_PCLK / CAN_QUANTA * 10U / (x))

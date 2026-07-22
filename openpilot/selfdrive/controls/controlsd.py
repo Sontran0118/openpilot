@@ -204,7 +204,10 @@ class Controls:
                          (self.sm['selfdriveState'].state == State.softDisabling))
 
     # trigger the car's stock driver monitoring escalation
-    CC.driverMonitoringEscalation = cs.forceDecel
+    try:
+      CC.driverMonitoringEscalation = cs.forceDecel
+    except Exception:
+      pass  # field absent in older opendbc car.capnp (schema skew)
 
     lat_tuning = self.CP.lateralTuning.which()
     if self.CP.steerControlType == car.CarParams.SteerControlType.angle:

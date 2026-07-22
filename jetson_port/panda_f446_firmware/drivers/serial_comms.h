@@ -37,8 +37,14 @@ void serial_comms_tick(void) {
   if (!uart_recv_byte(&ser_rx[0], 2U)) { return; }
   if (ser_rx[0] != SERIAL_SYNC_BYTE) { return; }   // not aligned: drop 1 byte, retry next tick
 
-  // read the remaining 6 header bytes; on timeout flush and resync
-  if (!uart_recv_raw(&ser_rx[1], SERIAL_HEADER_SIZE - 1U, 20U)) { uart_flush_rx(); return; }
+  // read the remaining 6 header bytes. Keep this SHORT: at 1.5 Mbaud a full
+  // header takes ~47 us, so 3 ms is generous. A long timeout here parks the
+  // whole main loop when the host sends a stray SYNC byte.
+#define SERIAL_HDR_TIMEOUT_MS 3U
+  if (!uart_recv_raw(&ser_rx[1], SERIAL_HEADER_SIZE - 1U, SERIAL_HDR_TIMEOUT_MS)) {
+    uart_flush_rx();
+    return;
+  }
   if (serial_checksum(ser_rx, SERIAL_HEADER_SIZE) != 0U) {
     uart_flush_rx();
     uint8_t nack = SERIAL_NACK; uart_send_raw(&nack, 1U); return;
@@ -54,7 +60,7 @@ void serial_comms_tick(void) {
   // 2) ack header, then read mosi data (if any) + its checksum byte
   uint8_t hack = SERIAL_HACK; uart_send_raw(&hack, 1U);
   if (mosi_len > 0U) {
-    if (!uart_recv_raw(&ser_rx[SERIAL_HEADER_SIZE], mosi_len + 1U, 50U)) { uart_flush_rx(); return; }
+    if (!uart_recv_raw(&ser_rx[SERIAL_HEADER_SIZE], mosi_len + 1U, 25U)) { uart_flush_rx(); return; }
     if (serial_checksum(&ser_rx[SERIAL_HEADER_SIZE], mosi_len + 1U) != 0U) {
       uart_flush_rx();
       uint8_t nack = SERIAL_NACK; uart_send_raw(&nack, 1U); return;

@@ -1,5 +1,5 @@
 diff --git a/SConscript b/SConscript
-index 0fe6723f..0f896780 100644
+index 0fe6723f..cf75a440 100644
 --- a/SConscript
 +++ b/SConscript
 @@ -90,7 +90,7 @@ def build_project(project_name, project, main, extra_flags):
@@ -11,7 +11,7 @@ index 0fe6723f..0f896780 100644
      ASCOM="$AS $ASFLAGS -o $TARGET -c $SOURCES",
      BUILDERS={
        'Objcopy': Builder(generator=objcopy, suffix='.bin', src_suffix='.elf')
-@@ -167,6 +167,24 @@ with open("board/obj/cert.h", "w") as f:
+@@ -167,6 +167,25 @@ with open("board/obj/cert.h", "w") as f:
  build_project("panda", base_project_f4, "./board/main.c", [])
  build_project("panda_h7", base_project_h7, "./board/main.c", [])
  
@@ -26,6 +26,7 @@ index 0fe6723f..0f896780 100644
 +    "-DSTM32F4",
 +    "-DSTM32F446xx",
 +    "-DPANDA_NUCLEO",
++    "-DMAZDA_FILTER",
 +    "-Iboard/stm32f446/inc",
 +    "-mfpu=fpv4-sp-d16",
 +  ],
@@ -50,7 +51,7 @@ index 94ef5490..6b6bda07 100644
    #include "board/stm32f4/stm32f4_config.h"
  #else
 diff --git a/board/drivers/bxcan.h b/board/drivers/bxcan.h
-index 75bd05d5..ba0d66b4 100644
+index 75bd05d5..35c16e86 100644
 --- a/board/drivers/bxcan.h
 +++ b/board/drivers/bxcan.h
 @@ -1,5 +1,14 @@
@@ -68,8 +69,39 @@ index 75bd05d5..ba0d66b4 100644
  // IRQs: CAN1_TX, CAN1_RX0, CAN1_SCE
  //       CAN2_TX, CAN2_RX0, CAN2_SCE
  //       CAN3_TX, CAN3_RX0, CAN3_SCE
+@@ -66,6 +75,9 @@ void update_can_health_pkt(uint8_t can_number, uint32_t ir_reg) {
+ // ***************************** CAN *****************************
+ // CANx_SCE IRQ Handler
+ static void can_sce(uint8_t can_number) {
++  CAN_TypeDef *CANx = CANIF_FROM_CAN_NUM(can_number);
++  // clear latched FIFO overrun so reception can resume
++  CANx->RF0R |= (CAN_RF0R_FOVR0 | CAN_RF0R_FULL0);
+   update_can_health_pkt(can_number, 1U);
+ }
+ 
+@@ -136,6 +148,12 @@ void can_rx(uint8_t can_number) {
+   CAN_TypeDef *CANx = CANIF_FROM_CAN_NUM(can_number);
+   uint8_t bus_number = BUS_NUM_FROM_CAN_NUM(can_number);
+ 
++  // FOVR0 recovery: clear FIFO overrun/full flags (write-1-to-clear).
++  // Once FOVR0 latches, bxCAN stops accepting new frames until it is cleared.
++  if ((CANx->RF0R & (CAN_RF0R_FOVR0 | CAN_RF0R_FULL0)) != 0U) {
++    CANx->RF0R |= (CAN_RF0R_FOVR0 | CAN_RF0R_FULL0);
++  }
++
+   while ((CANx->RF0R & CAN_RF0R_FMP0) != 0U) {
+     can_health[can_number].total_rx_cnt += 1U;
+ 
+@@ -175,6 +193,7 @@ void can_rx(uint8_t can_number) {
+       can_health[can_number].total_fwd_cnt += 1U;
+     }
+ 
++    vehicle_state_update(to_push.addr, &to_push.data[0]);
+     safety_rx_invalid += safety_rx_hook(&to_push) ? 0U : 1U;
+     ignition_can_hook(&to_push);
+ 
 diff --git a/board/drivers/can_common.h b/board/drivers/can_common.h
-index 23e0c1a4..de7132d3 100644
+index 23e0c1a4..5a6b5f5e 100644
 --- a/board/drivers/can_common.h
 +++ b/board/drivers/can_common.h
 @@ -22,8 +22,16 @@ bool can_loopback = false;
@@ -77,7 +109,7 @@ index 23e0c1a4..de7132d3 100644
    can_ring can_##x = { .w_ptr = 0, .r_ptr = 0, .fifo_size = (size), .elems = (CANPacket_t *)&(elems_##x) };
  
 +#ifdef STM32F446xx
-+#define CAN_RX_BUFFER_SIZE 1024U   // 128K RAM: 4096 does not fit
++#define CAN_RX_BUFFER_SIZE 2048U   // deep queue, keeps ~20KB stack headroom
 +#else
  #define CAN_RX_BUFFER_SIZE 4096U
 +#endif
@@ -123,12 +155,14 @@ index 90ee66df..bc7ba13d 100644
  #define CHECK_COLLISION(hash, addr) (((uint32_t) register_map[hash].address != 0U) && (register_map[hash].address != (addr)))
  
 diff --git a/board/main.c b/board/main.c
-index dbc6e343..ca25a945 100644
+index dbc6e343..74e2cd9c 100644
 --- a/board/main.c
 +++ b/board/main.c
-@@ -28,6 +28,10 @@
+@@ -27,7 +27,12 @@
+ #include "board/obj/gitversion.h"
  
  #include "board/can_comms.h"
++#include "board/vehicle_state.h"
  #include "board/main_comms.h"
 +#ifdef PANDA_NUCLEO
 +#include "board/drivers/serial_uart_raw.h"
@@ -137,7 +171,7 @@ index dbc6e343..ca25a945 100644
  
  
  // ********************* Serial debugging *********************
-@@ -326,7 +330,12 @@ int main(void) {
+@@ -326,7 +331,12 @@ int main(void) {
    print("DEBUG ENABLED\n");
  #endif
    // enable USB (right before interrupts or enum can fail!)
@@ -150,7 +184,7 @@ index dbc6e343..ca25a945 100644
  
    if (current_board->has_spi) {
      gpio_spi_init();
-@@ -342,6 +351,20 @@ int main(void) {
+@@ -342,6 +352,20 @@ int main(void) {
  
    // LED should keep on blinking all the time
    while (true) {
@@ -171,3 +205,19 @@ index dbc6e343..ca25a945 100644
      if (power_save_status == POWER_SAVE_STATUS_DISABLED) {
        #ifdef DEBUG_FAULTS
        if (fault_status == FAULT_STATUS_NONE) {
+diff --git a/board/main_comms.h b/board/main_comms.h
+index 6b049f6e..de782333 100644
+--- a/board/main_comms.h
++++ b/board/main_comms.h
+@@ -201,6 +201,11 @@ int comms_control_handler(ControlPacket_t *req, uint8_t *resp) {
+         (void)memcpy(resp, &code[code_len + 64], resp_len);
+       }
+       break;
++    // **** 0xd5: get decoded Mazda vehicle state
++    case 0xd5:
++      (void)memcpy(resp, (uint8_t *)&vehicle_state, sizeof(vehicle_state));
++      resp_len = sizeof(vehicle_state);
++      break;
+     // **** 0xd6: get version
+     case 0xd6:
+       COMPILE_TIME_ASSERT(sizeof(gitversion) <= USBPACKET_MAX_SIZE);

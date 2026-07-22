@@ -20,6 +20,14 @@ void gpio_can_init(void) {
 
 // Common GPIO initialization
 void common_init_gpio(void) {
+  // GPIO clocks FIRST - touching a GPIO port with its clock gated hangs the bus.
+  // (peripherals_init() enables these too, but it runs AFTER this function.)
+  RCC->AHB1ENR |= RCC_AHB1ENR_GPIOAEN;
+  RCC->AHB1ENR |= RCC_AHB1ENR_GPIOBEN;
+  RCC->AHB1ENR |= RCC_AHB1ENR_GPIOCEN;
+  // short settling delay after enabling a peripheral clock
+  for (volatile int _i = 0; _i < 32; _i++);
+
   GPIOA->ODR = 0;
   GPIOB->ODR = 0;
   GPIOA->PUPDR = 0;

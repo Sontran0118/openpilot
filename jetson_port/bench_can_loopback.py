@@ -55,14 +55,33 @@ class SerialPanda:
         h[5]=cksum(h[:5]+dat)
         self._txn(3, bytes(h)+dat, 0)
     def can_recv(self):
-        raw=self._txn(1, b"", 1024)
-        out=[]
-        d=raw or b""
-        while len(d)>=6:
-            dl=DLC_TO_LEN[d[0]>>4]; bus=(d[0]>>1)&0x7
-            w=d[1]|(d[2]<<8)|(d[3]<<16)|(d[4]<<24); addr=w>>3
-            if len(d)<6+dl: break
-            out.append((addr, bytes(d[6:6+dl]), bus)); d=d[6+dl:]
+        # Parse the packed CAN stream with validation + resync.
+        # Without this, a single byte of misalignment corrupts every following
+        # frame: the bus/addr/len fields are read at wrong offsets, producing
+        # impossible IDs (>0x7FF), impossible lengths (>8) and bus-0 payloads
+        # mislabelled as bus 1. On a bad header we drop ONE byte and retry,
+        # which re-locks onto the next real frame boundary.
+        raw = self._txn(1, b"", 2040)
+        out = []
+        d = raw or b""
+        i = 0
+        n = len(d)
+        while i + 6 <= n:
+            dlc = d[i] >> 4
+            bus = (d[i] >> 1) & 0x7
+            dl = DLC_TO_LEN[dlc]
+            w = d[i+1] | (d[i+2] << 8) | (d[i+3] << 16) | (d[i+4] << 24)
+            addr = w >> 3
+            ext = (w >> 2) & 1
+            # validity checks: standard IDs are 11-bit, classic CAN is <=8 bytes,
+            # and this firmware only has buses 0-2.
+            ok = (dl <= 8) and (bus <= 2) and (i + 6 + dl <= n) and \
+                 (addr <= 0x1FFFFFFF if ext else addr <= 0x7FF)
+            if not ok:
+                i += 1          # resync: slide one byte and retry
+                continue
+            out.append((addr, bytes(d[i+6:i+6+dl]), bus))
+            i += 6 + dl
         return out
 
 def main():

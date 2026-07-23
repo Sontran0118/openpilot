@@ -144,20 +144,37 @@ bool llcan_init(CAN_TypeDef *CANx) {
       0x078U, 0x078U, 0x078U  // padding (harmless duplicates)
     };
 
-    // 16-bit scale (FS1R bit clear) + LIST mode (FM1R bit set) for banks 0..4
-    CANx->FS1R &= ~0x1FU;
-    CANx->FM1R |= 0x1FU;
+    // MASTER/SLAVE FIX (F446): CAN1+CAN2 SHARE one filter block; CAN2 (slave) has
+    // NO filter regs of its own -- ALL filter access must go through CAN1, and the
+    // CAN2SB field in CAN1->FMR splits the banks. The old code wrote CANx->..., so
+    // for CAN2 the filter never activated -> CAN2 accepted no frames (FORM/no-rx).
+    // Fix: configure through CAN1. CAN2SB=14 -> banks 0..4 = CAN1, banks 14..18 = CAN2.
+    // We write the SAME 17-ID Mazda list into both bank ranges so either bus filters
+    // identically. Whichever CANx we're initing, the shared config is (re)applied.
+    const uint8_t base = (CANx == CAN1) ? 0U : 14U;   // this bus's filter bank range
 
-    for (uint8_t bank = 0U; bank < 5U; bank++) {
-      const uint16_t a = mazda_ids[(bank * 4U) + 0U];
-      const uint16_t b = mazda_ids[(bank * 4U) + 1U];
-      const uint16_t c = mazda_ids[(bank * 4U) + 2U];
-      const uint16_t d = mazda_ids[(bank * 4U) + 3U];
+    // filter config lives in the master (CAN1). enter filter-init on the master.
+    register_set_bits(&(CAN1->FMR), CAN_FMR_FINIT);
+    register_set(&(CAN1->FMR), (14UL << CAN_FMR_CAN2SB_Pos) | CAN_FMR_FINIT,
+                 CAN_FMR_CAN2SB | CAN_FMR_FINIT);      // CAN2 start bank = 14
+
+    // 16-bit scale (FS1R clear) + LIST mode (FM1R set) for this bus's 5 banks
+    const uint32_t bankmask = 0x1FUL << base;
+    CAN1->FS1R &= ~bankmask;
+    CAN1->FM1R |= bankmask;
+
+    for (uint8_t i = 0U; i < 5U; i++) {
+      const uint8_t bank = base + i;
+      const uint16_t a = mazda_ids[(i * 4U) + 0U];
+      const uint16_t b = mazda_ids[(i * 4U) + 1U];
+      const uint16_t c = mazda_ids[(i * 4U) + 2U];
+      const uint16_t d = mazda_ids[(i * 4U) + 3U];
       // STID occupies bits 15:5 of each 16-bit half
-      CANx->sFilterRegister[bank].FR1 = ((uint32_t)(b << 5) << 16) | (uint32_t)(a << 5);
-      CANx->sFilterRegister[bank].FR2 = ((uint32_t)(d << 5) << 16) | (uint32_t)(c << 5);
+      CAN1->sFilterRegister[bank].FR1 = ((uint32_t)(b << 5) << 16) | (uint32_t)(a << 5);
+      CAN1->sFilterRegister[bank].FR2 = ((uint32_t)(d << 5) << 16) | (uint32_t)(c << 5);
     }
-    CANx->FA1R |= 0x1FU;   // activate banks 0-4
+    CAN1->FA1R |= bankmask;                            // activate this bus's banks
+    register_clear_bits(&(CAN1->FMR), CAN_FMR_FINIT);  // leave filter-init on master
 #else
     // no mask
     // For some weird reason some of these registers do not want to set properly on CAN2 and CAN3. Probably something to do with the single/dual mode and their different filters.

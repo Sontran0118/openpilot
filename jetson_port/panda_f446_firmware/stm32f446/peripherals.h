@@ -1,7 +1,7 @@
 // Peripheral init for the Nucleo-F446RE panda port.
 // Link to Jetson = USART2 over the ST-Link VCP (PA2=TX, PA3=RX). No native USB used.
 // CAN1 = PB8(RX)/PB9(TX) [AF9] -> transceiver 1 -> car main bus
-// CAN2 = PB5(RX)/PB6(TX) [AF9] -> transceiver 2 -> car camera/LKAS bus
+// CAN2 = PB5(RX=D4)/PB6(TX=D10) [AF9] -> transceiver 2 -> car camera/LKAS bus
 
 void gpio_usart2_init(void) {
   // PA2/PA3: USART2 (ST-Link VCP). AF7.
@@ -13,7 +13,7 @@ void gpio_can_init(void) {
   // CAN1: PB8 RX, PB9 TX (AF9)
   set_gpio_alternate(GPIOB, 8, GPIO_AF9_CAN1);
   set_gpio_alternate(GPIOB, 9, GPIO_AF9_CAN1);
-  // CAN2: PB5 RX, PB6 TX (AF9)
+  // CAN2: PB5 RX (D4), PB6 TX (D10) (AF9) -> transceiver 2
   set_gpio_alternate(GPIOB, 5, GPIO_AF9_CAN2);
   set_gpio_alternate(GPIOB, 6, GPIO_AF9_CAN2);
 }

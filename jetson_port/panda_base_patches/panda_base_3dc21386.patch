@@ -51,7 +51,7 @@ index 94ef5490..6b6bda07 100644
    #include "board/stm32f4/stm32f4_config.h"
  #else
 diff --git a/board/drivers/bxcan.h b/board/drivers/bxcan.h
-index 75bd05d5..35c16e86 100644
+index 75bd05d5..637f5670 100644
 --- a/board/drivers/bxcan.h
 +++ b/board/drivers/bxcan.h
 @@ -1,5 +1,14 @@
@@ -100,8 +100,40 @@ index 75bd05d5..35c16e86 100644
      safety_rx_invalid += safety_rx_hook(&to_push) ? 0U : 1U;
      ignition_can_hook(&to_push);
  
+@@ -194,9 +213,13 @@ static void CAN2_TX_IRQ_Handler(void) { process_can(1); }
+ static void CAN2_RX0_IRQ_Handler(void) { can_rx(1); }
+ static void CAN2_SCE_IRQ_Handler(void) { can_sce(1); }
+ 
++#ifndef STM32F446xx
+ static void CAN3_TX_IRQ_Handler(void) { process_can(2); }
+ static void CAN3_RX0_IRQ_Handler(void) { can_rx(2); }
+ static void CAN3_SCE_IRQ_Handler(void) { can_sce(2); }
++#endif
++// (F446: CAN3 aliases CAN2, so these handlers would collide with CAN2's on the
++//  same IRQ vector and mislabel CAN2 frames as bus 2 — omitted on F446.)
+ 
+ bool can_init(uint8_t can_number) {
+   bool ret = false;
+@@ -207,9 +230,17 @@ bool can_init(uint8_t can_number) {
+   REGISTER_INTERRUPT(CAN2_TX_IRQn, CAN2_TX_IRQ_Handler, CAN_INTERRUPT_RATE, FAULT_INTERRUPT_RATE_CAN_2)
+   REGISTER_INTERRUPT(CAN2_RX0_IRQn, CAN2_RX0_IRQ_Handler, CAN_INTERRUPT_RATE, FAULT_INTERRUPT_RATE_CAN_2)
+   REGISTER_INTERRUPT(CAN2_SCE_IRQn, CAN2_SCE_IRQ_Handler, CAN_INTERRUPT_RATE, FAULT_INTERRUPT_RATE_CAN_2)
++#ifndef STM32F446xx
+   REGISTER_INTERRUPT(CAN3_TX_IRQn, CAN3_TX_IRQ_Handler, CAN_INTERRUPT_RATE, FAULT_INTERRUPT_RATE_CAN_3)
+   REGISTER_INTERRUPT(CAN3_RX0_IRQn, CAN3_RX0_IRQ_Handler, CAN_INTERRUPT_RATE, FAULT_INTERRUPT_RATE_CAN_3)
+   REGISTER_INTERRUPT(CAN3_SCE_IRQn, CAN3_SCE_IRQ_Handler, CAN_INTERRUPT_RATE, FAULT_INTERRUPT_RATE_CAN_3)
++#else
++  // F446 THE BUG: CAN3_*_IRQn are #define'd to CAN2_*_IRQn (CAN3 aliases CAN2).
++  // Registering the CAN3 handlers here OVERWRITES the CAN2 handlers for the SAME
++  // IRQ vector -> a CAN2 RX interrupt runs can_rx(2) instead of can_rx(1), so
++  // CAN2's frames get tagged bus 2 and never appear on bus 1. Skip them: CAN2's
++  // own handlers (registered just above) must win.
++#endif
+ 
+   if (can_number != 0xffU) {
+     CAN_TypeDef *CANx = CANIF_FROM_CAN_NUM(can_number);
 diff --git a/board/drivers/can_common.h b/board/drivers/can_common.h
-index 23e0c1a4..5a6b5f5e 100644
+index 23e0c1a4..12ee810e 100644
 --- a/board/drivers/can_common.h
 +++ b/board/drivers/can_common.h
 @@ -22,8 +22,16 @@ bool can_loopback = false;
@@ -121,6 +153,20 @@ index 23e0c1a4..5a6b5f5e 100644
  
  #ifdef STM32H7
  // ITCM RAM and DTCM RAM are the fastest for Cortex-M7 core access
+@@ -143,6 +151,13 @@ void can_init_all(void) {
+       bus_config[i].can_data_speed = 0U;
+     #endif
+     can_clear(can_queues[i]);
++#ifdef STM32F446xx
++    // F446 has only CAN1+CAN2; CAN3 is #define'd to CAN2 (cans[2]==CAN2). Calling
++    // can_init(2) would RE-initialize the already-running CAN2 -- it re-enters
++    // INRQ mid-operation and re-clocks the peripheral, leaving it mis-synced so
++    // it STUFF/FORM-errors on real traffic. Skip the phantom CAN3 init.
++    if (i == 2U) { continue; }
++#endif
+     (void)can_init(i);
+   }
+ }
 diff --git a/board/drivers/harness.h b/board/drivers/harness.h
 index 3ebf109f..1203f97c 100644
 --- a/board/drivers/harness.h
@@ -206,10 +252,10 @@ index dbc6e343..74e2cd9c 100644
        #ifdef DEBUG_FAULTS
        if (fault_status == FAULT_STATUS_NONE) {
 diff --git a/board/main_comms.h b/board/main_comms.h
-index 6b049f6e..de782333 100644
+index 6b049f6e..970ef6f6 100644
 --- a/board/main_comms.h
 +++ b/board/main_comms.h
-@@ -201,6 +201,11 @@ int comms_control_handler(ControlPacket_t *req, uint8_t *resp) {
+@@ -201,6 +201,33 @@ int comms_control_handler(ControlPacket_t *req, uint8_t *resp) {
          (void)memcpy(resp, &code[code_len + 64], resp_len);
        }
        break;
@@ -217,6 +263,28 @@ index 6b049f6e..de782333 100644
 +    case 0xd5:
 +      (void)memcpy(resp, (uint8_t *)&vehicle_state, sizeof(vehicle_state));
 +      resp_len = sizeof(vehicle_state);
++      break;
++    // **** 0xd7: dump live CAN + GPIO registers for param1=can_number (debug)
++    case 0xd7:
++      if (req->param1 < 3U) {
++        CAN_TypeDef *CANx = CANIF_FROM_CAN_NUM((uint8_t)req->param1);
++        uint32_t regs[12];
++        regs[0] = CANx->BTR;
++        regs[1] = CANx->MSR;
++        regs[2] = CANx->ESR;
++        regs[3] = CANx->MCR;
++        regs[4] = CAN1->FMR;
++        regs[5] = CAN1->FA1R;
++        regs[6] = CANx->RF0R;          // RX FIFO0: FMP0 (pending count), FOVR0, FULL0
++        // RAW PIN STATE: GPIOB IDR (input data reg) — bit5=PB5(CAN2 RX), bit8=PB8(CAN1 RX)
++        regs[7] = GPIOB->IDR;
++        regs[8] = GPIOB->MODER;        // is PB5 in ALTERNATE mode (0b10)?
++        regs[9] = GPIOB->AFR[0];       // AF for PB0-7: PB5 nibble at bits 20-23 (should be 9)
++        regs[10] = GPIOB->AFR[1];      // AF for PB8-15: PB8 nibble
++        regs[11] = CANx->sFIFOMailBox[0].RIR;  // top RX mailbox ID reg (if a frame sits there)
++        (void)memcpy(resp, (uint8_t *)regs, sizeof(regs));
++        resp_len = sizeof(regs);
++      }
 +      break;
      // **** 0xd6: get version
      case 0xd6:

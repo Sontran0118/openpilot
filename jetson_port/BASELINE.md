@@ -1,8 +1,12 @@
-# Jetson Mazda port baseline — 2026-07-22
+# Jetson Mazda port baseline — 2026-07-22, revised 2026-07-25
 
-This records the last verified prototype state before the deterministic-build
-and CAN-topology corrections. It is a preservation baseline, not an
-actuation-ready release.
+Originally recorded the prototype state before the deterministic-build and
+CAN-topology corrections, when the CAN hardware was not yet wired and working.
+Revised 2026-07-25 after those corrections landed and the transport was verified
+against the car; see "Known blockers and accuracy notes" for what changed.
+
+Still not an actuation-ready release — but the remaining gate is bring-up
+evidence (engagement, calibration, road data), not hardware readiness.
 
 ## Source revisions
 
@@ -50,17 +54,70 @@ b447d4fd0329aab266fe2903ed3b565fe601808fe280eb26f55b52f509a7778d  params_pyx.so
 
 ## Known blockers and accuracy notes
 
-- A clean firmware build currently fails because `vehicle_state_update()` is
-  compiled into the bootstub and is unused under `-Werror`. The preserved
-  bootstub binary predates that source change and must be treated as stale.
-- F446 CAN3 is currently aliased to CAN2 while `PANDA_CAN_CNT` remains three.
-  This duplicates peripheral initialization and IRQ registration and must be
-  replaced by an explicit physical CAN1/logical bus 0 and physical
-  CAN2/logical bus 2 mapping.
+Resolved on 2026-07-25 (superseding the 2026-07-22 entries; the original list was
+written before the CAN hardware was wired and working):
+
+- Firmware builds clean. The `vehicle_state_update()` `-Werror` failure was a
+  header-ordering bug (`bxcan.h` called it before `vehicle_state.h` was included,
+  and unconditionally); it is now included at point of use behind `PANDA_NUCLEO`.
+  Same commit also unbroke the stock `panda` and `panda_h7` targets.
+- CAN3-aliasing is gone. Physical CAN2 now presents as **logical bus 2** via the
+  `bus_config` table, which is what openpilot's `get_fwd_bus()` (0 <-> 2) and the
+  Mazda mode's `MAZDA_CAM = 2` require. `can_init_all()` bounds real init with
+  `F446_CAN_CNT`; `can_set_orientation()` is a no-op on F446 (the stock 0<->2 swap
+  assumed a can_number 2 that does not exist and would clobber the mapping).
+- CAN bit timing retuned for the F446's 45 MHz APB1: 15 tq, SEQ1/SEQ2 = 11/3,
+  SJW 3 -> exactly 500 kbps at an 80.0% sample point (was 86.7%, SJW 2).
+- Serial `miso_len` is clamped. pandad requests `RECV_SIZE` (16384) on the CAN
+  read endpoint against a 2048-byte `ser_tx`; unclamped, `comms_can_read()` wrote
+  ~14KB past the buffer on every poll. This surfaced as "Panda CAN checksum
+  failed" but was RAM corruption on a 128KB part.
+- CAN ignition detection works. The stock Mazda hook keys off 0x9E (MSG_05),
+  which the CX-5 2023 does not transmit, so `ignition_can` was false forever and
+  pandad held NO_OUTPUT. Now derived from ENGINE_DATA (0x202) RPM; verified
+  `ignition_can=1` with the engine running.
+
+Verified on the car (2026-07-25, stationary, engine running):
+
+- 2-minute sustained soak in SAFETY_MAZDA with both buses actively ACKing:
+  93,432 frames received on bus 0 and **forwarded to the camera bus**, 2,179
+  frames back from the LKAS module, REC=0, no error-passive/bus-off, zero rx loss.
+- The LKAS module only transmits when the panda ACKs it (isolated-segment
+  behaviour); in SAFETY_SILENT that bus is dead.
+- `pandad` connects over the serial VCP and runs clean for 60s.
+- Real TensorRT supercombo -> curvature -> modelV2 -> real `controlsd` process
+  -> `carControl.actuators.torque`, on both synthetic and live IMX477 frames.
+  Torque tracks curvature and reverses sign with it.
+- Persistent camera capture: 59.7 fps, 60/60 frames (was ~1 frame / 15 s).
+
+Still open:
+
+- **Auto-exposure does not work.** openpilot's AE math is ported
+  (`op_camera.py`), but `nvarguscamerasrc` only accepts a new exposure at
+  pipeline construction, and rebuilding mid-stream kills the stream. Usable mode
+  today is `auto_exposure=False`. Needs Argus runtime properties or the Argus C++
+  API.
+- **Calibration has never been learned.** `/tmp/op_calib.json` does not exist, so
+  every frame so far was warped with rpy = (0,0,0). The online calibrator
+  (`op_calibrate.py`, a `calibrationd` port) needs a straight drive at speed.
+- **Engagement has never been demonstrated**, on bench or car. A bench harness
+  driving the real `selfdrived` + `controlsd` confirms `pedalPressed` fires on
+  brake and `steerOverride` fires on steering input, but the state machine
+  correctly refuses to leave `disabled` without the real daemon set
+  (`posenetInvalid`, `cameraMalfunction`, `sensorDataInvalid`, `usbError`).
+- `is_onroad` needs `hardwared`, which is gated on `HasAcceptedTerms` and
+  `CompletedTrainingVersion` — user-consent flags, deliberately not set by tooling.
 - Wheel speeds in the 0xd5 vehicle-state packet are raw DBC values; the
   documented `kph*100` contract omits the Mazda `-100 km/h` offset.
 - The demonstrated control chain ends at `carControl`. Mazda CarController,
-  mazdacan, pandad, and panda safety have not yet been joined into one send
-  path.
-- No vehicle actuation is authorized by this baseline. Hardware output remains
-  gated until the bench, replay, relay, and in-person safety stages pass.
+  mazdacan, pandad, and panda safety have not yet been joined into one send path.
+- The model has never seen a road. Every frame to date is a parking lot or
+  synthetic.
+
+Actuation gate: the CAN transport, forwarding path and safety-mode plumbing are
+now demonstrated on the car, so the hardware objection in the 2026-07-22 baseline
+no longer applies. The remaining gate is **not** hardware readiness — it is that
+engagement is undemonstrated, calibration is unlearned, and no road data exists.
+Recommended next step is a **dashcam-mode drive** (camera mounted, model running,
+calibration learning, everything logged, panda in SAFETY_SILENT) before any
+actuation.

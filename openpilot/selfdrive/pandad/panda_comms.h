@@ -83,5 +83,7 @@ public:
 private:
   int fd = -1;
   inline static std::recursive_mutex hw_lock;
+  // transfer() retries with a flush+resync; transfer_once() is a single attempt.
   int transfer(uint8_t endpoint, uint8_t *tx, uint16_t tx_len, uint8_t *rx, uint16_t max_rx, unsigned int timeout);
+  int transfer_once(uint8_t endpoint, uint8_t *tx, uint16_t tx_len, uint8_t *rx, uint16_t max_rx, unsigned int timeout);
 };

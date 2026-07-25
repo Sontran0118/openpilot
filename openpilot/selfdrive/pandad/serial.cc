@@ -22,6 +22,9 @@
 #define SER_CKSTART 0xAB
 #define SER_HDR 7
 #define SER_BAUD B1500000
+// retry/resync: the device's header timeout is 3ms, so wait past it before re-sending
+#define SER_MAX_RETRIES 5
+#define SER_RESYNC_US 5000
 
 static uint8_t ser_checksum(const uint8_t *d, int n) {
   uint8_t c = SER_CKSTART; for (int i = 0; i < n; i++) c ^= d[i]; return c;
@@ -47,10 +50,10 @@ static bool read_exact(int fd, uint8_t *b, int n) {
   return true;
 }
 
-// one transaction: send framed request, read framed response. returns resp data length or -1.
-int PandaSerialHandle::transfer(uint8_t endpoint, uint8_t *tx, uint16_t tx_len,
-                                uint8_t *rx, uint16_t max_rx, unsigned int timeout) {
-  std::lock_guard<std::recursive_mutex> lock(hw_lock);
+// one transaction attempt: send framed request, read framed response.
+// returns resp data length, or -1 if the device NACKed / went quiet / desynced.
+int PandaSerialHandle::transfer_once(uint8_t endpoint, uint8_t *tx, uint16_t tx_len,
+                                     uint8_t *rx, uint16_t max_rx, unsigned int timeout) {
   uint8_t hdr[SER_HDR];
   hdr[0] = SER_SYNC; hdr[1] = endpoint;
   hdr[2] = tx_len & 0xFF; hdr[3] = tx_len >> 8;
@@ -59,15 +62,17 @@ int PandaSerialHandle::transfer(uint8_t endpoint, uint8_t *tx, uint16_t tx_len,
   // serial_checksum = SER_CKSTART XOR b[0..5] XOR b[6]; solve b[6] = SER_CKSTART XOR b[0..5].
   hdr[6] = SER_CKSTART; for (int i = 0; i < 6; i++) hdr[6] ^= hdr[i];
 
+  // The device only allows SERIAL_HDR_TIMEOUT_MS (3ms) between the SYNC byte and
+  // the remaining 6, so the header must land as one contiguous write.
   if (write(fd, hdr, SER_HDR) != SER_HDR) { comms_healthy = false; return -1; }
   uint8_t ack;
   if (!read_exact(fd, &ack, 1) || ack != SER_HACK) return -1;
 
   if (tx_len > 0) {
-    write(fd, tx, tx_len);
+    if (write(fd, tx, tx_len) != (ssize_t)tx_len) { comms_healthy = false; return -1; }
     // device checks serial_checksum([data..][dck]) == 0 -> dck = SER_CKSTART XOR data
     uint8_t dck = SER_CKSTART; for (int i = 0; i < tx_len; i++) dck ^= tx[i];
-    write(fd, &dck, 1);
+    if (write(fd, &dck, 1) != 1) { comms_healthy = false; return -1; }
   }
   // response: [HACK][len lo][len hi][data][cksum]
   uint8_t rhdr[3];
@@ -78,6 +83,54 @@ int PandaSerialHandle::transfer(uint8_t endpoint, uint8_t *tx, uint16_t tx_len,
   if (rlen > 0) { if (!read_exact(fd, rx, rlen)) return -1; }
   uint8_t rck; read_exact(fd, &rck, 1);   // trailing checksum (not validated for now)
   return rlen;
+}
+
+// Retry wrapper. The firmware NACKs on any checksum failure and, when it sees a
+// byte that is not SYNC, drops exactly one byte and waits for the next tick. So
+// after a single glitch on the 1.5 Mbaud VCP the two ends can sit desynchronized
+// and EVERY later transaction fails until someone flushes. Recover the way the
+// working Python clients do: drain stale input, pause long enough for the device's
+// header timeout to expire, then re-send. Without this a momentary glitch is
+// permanent, which for pandad means losing the panda mid-drive.
+//
+// Retry safety, per endpoint (see the dispatch in board/drivers/serial_comms.h):
+//   ep 0 (control)  - the device runs comms_control_handler() BEFORE replying, so a
+//                     lost reply means the request already took effect. Re-sending
+//                     repeats it. Every control request pandad issues is idempotent
+//                     (set safety mode, set speed, read health/counters), so this is
+//                     safe; a non-idempotent request must not be retried here.
+//   ep 1/0x81 (CAN read) - comms_can_read() DEQUEUES before replying, so a lost reply
+//                     loses those frames for good. Retrying fetches the NEXT batch
+//                     rather than duplicating, which is the right behaviour: CAN is
+//                     lossy by nature and pandad handles gaps.
+//   ep 3 (CAN write) - NOT retried. The device may have already queued the frames
+//                     onto a live bus; re-sending would transmit them a second time.
+static inline bool endpoint_is_retry_safe(uint8_t endpoint) {
+  return endpoint != 3U;
+}
+
+int PandaSerialHandle::transfer(uint8_t endpoint, uint8_t *tx, uint16_t tx_len,
+                                uint8_t *rx, uint16_t max_rx, unsigned int timeout) {
+  std::lock_guard<std::recursive_mutex> lock(hw_lock);
+  if (fd < 0) return -1;
+
+  const int max_attempts = endpoint_is_retry_safe(endpoint) ? SER_MAX_RETRIES : 1;
+  for (int attempt = 0; attempt < max_attempts; attempt++) {
+    int ret = transfer_once(endpoint, tx, tx_len, rx, max_rx, timeout);
+    if (ret >= 0) {
+      comms_healthy = true;
+      return ret;
+    }
+    if (!connected) break;
+    // resync: drop anything stale in the RX path, then give the device's 3ms
+    // header timeout room to expire so it returns to hunting for SYNC.
+    // This runs even on the no-retry path (CAN write): we skip re-sending the
+    // frames, but the link itself must still be resynced for the NEXT call.
+    tcflush(fd, TCIFLUSH);
+    usleep(SER_RESYNC_US);
+  }
+  comms_healthy = false;
+  return -1;
 }
 
 int PandaSerialHandle::control_write(uint8_t request, uint16_t p1, uint16_t p2, unsigned int timeout) {

@@ -115,8 +115,11 @@ def _libflags(target, source, env, for_signature):
         libs.append(_resolve_lib(env, lib))
     else:
       libs.append(lib)
+  # LIBLITERALPREFIX is not defined by default on SCons 4.5; treat it as empty
+  # rather than raising KeyError out of the middle of variable expansion.
   return _stripixes(env['LIBLINKPREFIX'], libs, env['LIBLINKSUFFIX'],
-                    env['LIBPREFIXES'], env['LIBSUFFIXES'], env, env['LIBLITERALPREFIX'])
+                    env['LIBPREFIXES'], env['LIBSUFFIXES'], env,
+                    env.get('LIBLITERALPREFIX', ''))
 
 env = Environment(
   ENV={
@@ -314,16 +317,26 @@ def count_scons_nodes(nodes):
     seen.add(node)
     if hasattr(node, 'has_builder') and node.has_builder():
       build_product_nodes.add(node)
-    executor = node.get_executor()
-    if executor is not None:
-      stack += executor.get_all_prerequisites() + executor.get_all_children()
+    # Walking executors eagerly makes SCons expand construction variables far
+    # earlier than a normal build would, and some (e.g. LIBLITERALPREFIX on
+    # SCons 4.5) are not populated yet -- raising KeyError. This whole walk only
+    # feeds the progress percentage, so a failure here must not kill the build.
+    try:
+      executor = node.get_executor()
+      if executor is not None:
+        stack += executor.get_all_prerequisites() + executor.get_all_children()
+    except Exception:
+      continue
 
   return len(seen)
 
 progress_interval = 5
 progress_count = 0
 build_product_nodes = set()
-progress_total = max(1, count_scons_nodes(env.arg2nodes(BUILD_TARGETS or [Dir('.')], env.fs.Entry)))
+try:
+  progress_total = max(1, count_scons_nodes(env.arg2nodes(BUILD_TARGETS or [Dir('.')], env.fs.Entry)))
+except Exception:
+  progress_total = 1
 
 def progress_function(node):
   global progress_count

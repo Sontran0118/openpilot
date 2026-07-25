@@ -60,7 +60,7 @@ int PandaSerialHandle::transfer_once(uint8_t endpoint, uint8_t *tx, uint16_t tx_
   hdr[4] = max_rx & 0xFF; hdr[5] = max_rx >> 8;
   // checksum byte so the device's serial_checksum over all 7 bytes == 0.
   // serial_checksum = SER_CKSTART XOR b[0..5] XOR b[6]; solve b[6] = SER_CKSTART XOR b[0..5].
-  hdr[6] = SER_CKSTART; for (int i = 0; i < 6; i++) hdr[6] ^= hdr[i];
+  hdr[6] = ser_checksum(hdr, 6);
 
   // The device only allows SERIAL_HDR_TIMEOUT_MS (3ms) between the SYNC byte and
   // the remaining 6, so the header must land as one contiguous write.
@@ -71,7 +71,7 @@ int PandaSerialHandle::transfer_once(uint8_t endpoint, uint8_t *tx, uint16_t tx_
   if (tx_len > 0) {
     if (write(fd, tx, tx_len) != (ssize_t)tx_len) { comms_healthy = false; return -1; }
     // device checks serial_checksum([data..][dck]) == 0 -> dck = SER_CKSTART XOR data
-    uint8_t dck = SER_CKSTART; for (int i = 0; i < tx_len; i++) dck ^= tx[i];
+    uint8_t dck = ser_checksum(tx, tx_len);
     if (write(fd, &dck, 1) != 1) { comms_healthy = false; return -1; }
   }
   // response: [HACK][len lo][len hi][data][cksum]

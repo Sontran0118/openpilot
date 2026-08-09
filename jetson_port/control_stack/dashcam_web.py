@@ -4540,7 +4540,13 @@ def pipeline(args):
                 p.send_signal(signal.SIGINT); p.wait(timeout=4)
             except Exception:
                 p.kill()
-        cam.close()
+        # cam is None whenever there is no camera to open -- --can-only, and now
+        # --role panda. Unguarded this raised AttributeError on every clean
+        # shutdown of those modes. It fires AFTER the panda has been returned to
+        # SAFETY_NOOUTPUT, so nothing unsafe came of it, but a traceback on the
+        # normal exit path is exactly what hides the next real one.
+        if cam is not None:
+            cam.close()
         logf.close()
 
 
@@ -4564,6 +4570,23 @@ def main():
                          "competing with the tx thread for the GIL, and an "
                          "irregular 0x243 is what raises the front camera fault. "
                          "NOTE: no model means no lateral control at all.")
+    ap.add_argument("--role", choices=("both", "panda", "model"), default="both",
+                    help="Split the stack across two PROCESSES, the way stock "
+                         "openpilot does. 'both' (default) is the historical "
+                         "single-process behaviour and remains the fallback. "
+                         "'panda' owns the USB handle and runs the CAN receive, "
+                         "0x243 transmit and carState threads -- stock's pandad "
+                         "plus card. 'model' runs the camera, supercombo and the "
+                         "message publishing, and never touches the panda. "
+                         "WHY: a 10 ms transmit deadline is held to +-0.2 ms "
+                         "against ONE competing CPU-bound Python thread and "
+                         "collapses to p99 442 ms against THREE (measured "
+                         "2026-08-09). Stock never hits this because pandad is "
+                         "C++ and card is its own process; we opted out of that "
+                         "when we replaced them with in-process threads. Two "
+                         "processes means two GILs, which is the actual fix -- "
+                         "the CAN link itself accounts for under 4%% of the "
+                         "period at 100 Hz.")
     ap.add_argument("--no-daemons", action="store_true")
     ap.add_argument("--no-detect", action="store_true",
                     help="disable YOLO26n object detection (yolo_trt.py). Costs "
@@ -4664,6 +4687,25 @@ def main():
     # and are already correct, so the only thing that could drift is a NEW
     # feature that forgets to ask. Forcing the flags means it gets the answer
     # from the switch it already reads.
+    # --role panda is --can-only plus a live control input.
+    #
+    # --can-only already removes exactly the right things -- its own help text
+    # says "everything it removes was competing with the tx thread for the GIL"
+    # -- so the panda role reuses that switch rather than inventing a parallel
+    # set of gates that could drift from it.
+    #
+    # The one thing it got wrong is the "NO LATERAL CONTROL" caveat. That was
+    # true when this was the only process, because --can-only also suppresses
+    # the openpilot daemons and nothing was left to publish carControl. Split
+    # across two processes, controlsd lives with the MODEL role and carControl
+    # arrives over msgq, which the main loop already subscribes to and already
+    # turns into tx_state["torque_norm"]. So the panda role transmits real
+    # torque; it just does not compute it.
+    #
+    # Daemons stay off here on purpose: selfdrived and controlsd must be spawned
+    # exactly once, and the model role owns them.
+    if args.role == "panda":
+        args.can_only = True
     if args.can_only:
         args.no_daemons = args.no_scene = args.no_detect = True
         args.no_depth = args.no_roadseg = args.no_smooth = True
@@ -4688,8 +4730,14 @@ def main():
         # No frame is produced in this mode, so the page would serve a dead
         # image and the MJPEG loops would spin on an empty buffer forever.
         print("=" * 58)
-        print("  MODE: CAN ONLY -- no camera, no model, no preview, no web server")
-        print("  0x243 transmit + CAN receive + JSONL log. NO LATERAL CONTROL.")
+        if args.role == "panda":
+            print("  ROLE: PANDA -- owns the USB handle (stock's pandad + card)")
+            print("  CAN receive + 0x243 transmit + carState publish.")
+            print("  Lateral torque arrives as carControl over msgq from the")
+            print("  MODEL role; start that separately or nothing will steer.")
+        else:
+            print("  MODE: CAN ONLY -- no camera, no model, no preview, no web server")
+            print("  0x243 transmit + CAN receive + JSONL log. NO LATERAL CONTROL.")
         print("=" * 58)
     else:
         srv = ReusableHTTPServer(("0.0.0.0", args.port), Handler)

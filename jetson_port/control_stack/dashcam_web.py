@@ -3833,20 +3833,48 @@ def pipeline(args):
             # and then resumes, and a short window lands inside that pause and
             # reads a transient as a state change. Require every window in a 3 s
             # span to be silent, and bail out the moment one is not.
+            # SILENCE ONLY COUNTS IF THE CAR IS AWAKE.
+            #
+            # This test asks "is 0x21b quiet?" and calls quiet a success. An
+            # unpowered radar is also quiet, so switching the ignition off looks
+            # EXACTLY like a successful UDS takeover.
+            #
+            # OBSERVED 2026-08-09: the handshake failed outright -- "extended
+            # session failed", zero frames on the 0x76C tap -- and this check
+            # still printed "OK, radar silent" and started alpha long, because
+            # the car had been switched off. A failed handshake was overridden
+            # by a false positive, and the run transmitted 0x21b/0x21c believing
+            # it had taken over a radar that simply had no power.
+            #
+            # So require the car to be demonstrably alive in the SAME windows:
+            # 0x202 ENGINE_DATA is the CAN ignition source and runs at 100 Hz, so
+            # if it is absent nothing can be concluded about the radar at all.
             _WIN, _SPAN, _TOL = 0.5, 3.0, 3
             radar_suppressed = True
             _seen_total = 0
+            _ign_total = 0
             for _i in range(int(_SPAN / _WIN)):
                 _n0 = can_census[0].get(_CRZ_INFO, 0)
+                _i0 = can_census[0].get(0x202, 0)
                 time.sleep(_WIN)
                 _n = can_census[0].get(_CRZ_INFO, 0) - _n0
+                _ign_total += can_census[0].get(0x202, 0) - _i0
                 _seen_total += _n
                 if _n > _TOL:               # ~21 frames per window at 43 Hz if alive
                     radar_suppressed = False
                     break
-            print("radar suppression: %s (0x21b %d frames over %.1f s)"
-                  % ("OK, radar silent" if radar_suppressed else "FAILED, radar still transmitting",
-                     _seen_total, (_i + 1) * _WIN))
+            if _ign_total < 10:
+                # Far below the ~300 frames 0x202 should produce over 3 s.
+                radar_suppressed = False
+                print("radar suppression: INCONCLUSIVE -- the car is asleep "
+                      "(0x202 %d frames over %.1f s). An unpowered radar is silent "
+                      "too, so this proves nothing. Start the engine and retry."
+                      % (_ign_total, (_i + 1) * _WIN))
+            else:
+                print("radar suppression: %s (0x21b %d frames over %.1f s, "
+                      "ignition alive at %d frames)"
+                      % ("OK, radar silent" if radar_suppressed else "FAILED, radar still transmitting",
+                         _seen_total, (_i + 1) * _WIN, _ign_total))
 
         threading.Thread(target=tx_thread, daemon=True).start()
         print(">>> ARMED: streaming 0x243 at %g Hz -> ramp %g counts/s "

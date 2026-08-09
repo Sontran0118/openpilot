@@ -1367,12 +1367,36 @@ def pipeline(args):
         lnv = (d[2] >> 3) & 1
         ldw = (d[2] >> 7) & 1
         b2 = (d[6] >> 4) & 1
-        if lnv or ldw or b2:
+        # With OP_LKAS_COPY_CAM_LINES set, create_steering_control reproduces the
+        # camera's LINE_NOT_VISIBLE and LDW instead of forcing them to 0, so those
+        # frames become comparable and MUST be compared -- they are the only
+        # evidence that the checksum's (lnv << 3) and (ldw << 7) terms are right.
+        #
+        # They have never been checked. The skip below is why: every frame that
+        # would exercise them was counted as skipped rather than failed, so ck_ok
+        # could climb forever while those two terms stayed unproven. The formula
+        # is reverse-engineered and fitted to captures, and a neighbouring term
+        # looks suspect on inspection -- ERR_BIT_2 sits at DBC bit 30 (byte 3,
+        # bit 6) yet the formula uses (er2 << 4) -- which survives only because
+        # error bits are normally 0. Treat the lnv/ldw terms with the same
+        # suspicion until ck_bad proves otherwise.
+        #
+        # ck_skip is therefore the cheap pre-test: run a drive with the flag OFF
+        # and if ck_skip stays 0, this camera never sets these bits at all, the
+        # copy would be a no-op, and the front camera fault has another cause.
+        _cmp_lines = getattr(mazdacan, "_COPY_CAM_LINES", False)
+        if b2 or ((lnv or ldw) and not _cmp_lines):
             cam_state["ck_skip"] += 1
             return
         # STEERING_ANGLE: DBC 33|12@0+ -> byte4 bits 1..0, byte5, byte6 bits 7..6
         ang = (((d[4] & 0x03) << 10) | (d[5] << 2) | ((d[6] >> 6) & 0x03)) - 2048
-        bits = {"BIT_1": (d[3] >> 5) & 1, "ERR_BIT_1": d[2] & 1, "ERR_BIT_2": (d[3] >> 6) & 1}
+        # LINE_NOT_VISIBLE/LDW are read by create_steering_control only when
+        # OP_LKAS_COPY_CAM_LINES is set, but they are supplied unconditionally:
+        # the call below is wrapped in a bare `except Exception: return`, so a
+        # missing key would not raise, it would silently stop validating and
+        # leave ck_ok/ck_bad frozen while everything looked fine.
+        bits = {"BIT_1": (d[3] >> 5) & 1, "ERR_BIT_1": d[2] & 1, "ERR_BIT_2": (d[3] >> 6) & 1,
+                "LINE_NOT_VISIBLE": lnv, "LDW": ldw}
         torque = (((d[0] & 0x0F) << 8) | d[1]) - 2048
         try:
             ref = mazdacan.create_steering_control(packer, CP, d[0] >> 4, torque, bits, ang)
@@ -4317,7 +4341,7 @@ def pipeline(args):
                       "| drv_trq=%+6.1f pressed=%d angle=%+7.2f "
                       "| eps_req=%+5d eps_eff=%+5d lkas_block=%d hands_off=%d "
                       "| blink=%d/%d bsm=%d/%d "
-                      "| cam_seen=%d cam_age=%.1fs lane_age=%.1fs ck=%d/%d "
+                      "| cam_seen=%d cam_age=%.1fs lane_age=%.1fs ck=%d/%d/%d "
                       "| mpc=%d mv=%.1f/%.1f ma=%+.2f a_raw=%+.2f a_cmd=%+.2f lim=%-10s "
                       "| txgap=%.0f/%.0fms late=%d "
                       "| ang_off=%+.2f(%d) "
@@ -4337,7 +4361,14 @@ def pipeline(args):
                          int(cam_state.get("seen", 0)),
                          (now - cam_state["last_t"]) if cam_state["last_t"] else -1.0,
                          (now - cam_state["lane_t"]) if cam_state["lane_t"] else -1.0,
+                         # ok/bad/skipped. skipped is the one that decides whether
+                         # OP_LKAS_COPY_CAM_LINES can help at all: it counts camera
+                         # frames carrying LINE_NOT_VISIBLE or LDW, which we
+                         # normally pin to 0. Stays 0 -> this camera never sets
+                         # them, the copy is a no-op, and the front camera fault
+                         # is something else.
                          int(cam_state.get("ck_ok", 0)), int(cam_state.get("ck_bad", 0)),
+                         int(cam_state.get("ck_skip", 0)),
                          int(_gov.get("mpc", 0)),
                          float(_mpc_state["v"]) * 3.6, float(cs_can.v_ego) * 3.6,
                          float(_mpc_state["a"]),

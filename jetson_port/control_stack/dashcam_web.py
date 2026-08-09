@@ -4028,6 +4028,35 @@ def pipeline(args):
             print(">>> ALPHA LONG ACTIVE: 0x21b/0x21c at 50 Hz, radar tester-present "
                   "at 2 Hz.\n    FCW / AEB / SBS ARE OFF while this runs.\n")
         elif alpha_long:
+            # A PREVIOUS RUN MAY HAVE LEFT THE RADAR MUTE. Restore it before
+            # giving up, or this is the worst state the car can be in.
+            #
+            # OBSERVED 2026-08-09: a run started with --alpha-long while the car
+            # was briefly asleep came back INCONCLUSIVE, so neither the alpha-long
+            # tx nor the radar-shadow replay started. But the run BEFORE it had
+            # genuinely suppressed the radar, and the radar recovers slowly --
+            # still mute 45 s after that process was killed. Net result: radar
+            # silent, nobody replaying its frames, and the forward camera saw its
+            # partner vanish with no substitute. The front camera fault came
+            # straight back, and this branch's "stock radar cruise is INTACT"
+            # message was simply wrong.
+            #
+            # So do not assume a failed suppression means an untouched radar. Send
+            # the documented inverse and say what happened. Safe if the radar was
+            # never suppressed: 10 01 / 28 00 01 / 85 01 into an already-default
+            # session is a no-op, and any of them may be NAKed without harm.
+            try:
+                with panda_lock:
+                    for _p in ([0x02, 0x10, 0x01, 0, 0, 0, 0, 0],
+                               [0x03, 0x28, 0x00, 0x01, 0, 0, 0, 0],
+                               [0x02, 0x85, 0x01, 0, 0, 0, 0, 0]):
+                        panda.can_send(_RADAR_ADDR, bytes(_p), 0)
+                        time.sleep(0.05)
+                print("    (sent radar restore 10 01 / 28 00 01 / 85 01 in case an "
+                      "earlier run left it muted)")
+            except Exception as _e:
+                print("    (radar restore failed: %s -- if the dash shows a camera "
+                      "fault, power-cycle)" % _e)
             # Hard refusal, not a warning. Transmitting 0x21b while the radar is
             # still transmitting it puts two writers with independent counters on
             # one address and the PCM acts on whichever it sees -- worse than no

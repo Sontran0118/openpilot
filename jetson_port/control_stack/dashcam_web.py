@@ -1059,6 +1059,12 @@ def overlay(frame, st, src_wh=None, minimal=False):
 
 
 def pipeline(args):
+    # Which half of the split this process is. Read first because the panda is
+    # opened long before the other flags are consulted, and only ONE process may
+    # hold that USB handle -- a second claim raises USBErrorBusy and takes the
+    # CAN link down with it. See --role.
+    role = getattr(args, "role", "both")
+    owns_panda = role != "model"
     import openpilot.cereal.messaging as messaging
     from cereal import log
     from opendbc.car.structs import car as car_struct
@@ -1083,6 +1089,13 @@ def pipeline(args):
     import subprocess, signal
 
     armed = getattr(args, "arm", False) or os.environ.get("DASHCAM_ARM") == "1"
+    # Arming is a panda operation end to end -- it sets SAFETY_MAZDA, starts the
+    # 0x243 tx thread and, under alpha long, opens a UDS session that really does
+    # change the car's state. None of that is the model role's to do, and it has
+    # no panda handle to do it with. Folded in at the definition rather than at
+    # the `if armed:` site so every downstream banner and warning agrees.
+    if not owns_panda:
+        armed = False
     mads = getattr(args, "mads", False) or os.environ.get("DASHCAM_MADS") == "1"
     alpha_long = getattr(args, "alpha_long", False) or os.environ.get("DASHCAM_ALPHA_LONG") == "1"
     if alpha_long and mads:
@@ -1177,92 +1190,104 @@ def pipeline(args):
     # the Nucleo-F446 -- there is no /dev/serial/by-id and no /dev/ttyACM*, so
     # SerialPanda(find_panda_port()) raised at startup no matter what flags were
     # passed. Same four methods, so nothing below changes. See jetson_port/usb_panda.py.
-    panda = UsbPanda()
-    # SAFETY_SILENT does NOT just stop transmitting -- it stops FORWARDING.
-    # nooutput_init() in opendbc/safety/modes/defaults.h returns
-    #     (safety_config){NULL, 0, NULL, 0, true}   // disable_forwarding = true
-    # and safety_fwd_hook() checks that first, returning -1 for every address.
+    # PANDA LIFECYCLE -- panda role only.
     #
-    # This build has NO harness relay (nucleo_harness_config), so the panda is the
-    # ONLY path between the forward camera on bus 2 and the car on bus 0. Silent
-    # mode therefore SEVERS them: the car sees no camera at all and raises a front
-    # camera sensor fault within seconds. A stock panda survives this because its
-    # relay re-bridges cam<->car whenever openpilot is not intercepting; we have no
-    # such fallback.
-    #
-    # So silent is the safe default only when the car is ASLEEP. With CAN ignition
-    # present, go straight to Mazda safety: it forwards and ACKs, and it commands
-    # nothing on its own -- the tx thread is what sends frames, and that only runs
-    # when armed. MEASURED 2026-08-07: the camera also needs the ACK. Left unacked
-    # it retransmits CAM_EMPTY at line rate (3656 Hz) and never reaches its real
-    # messages, because the panda is its only bus partner on that segment.
-    panda.control_write(0xdc, SAFETY_NOOUTPUT, 0)
-    print("panda: startup safety = SAFETY_NOOUTPUT "
-          "(no transmit; cam<->car passthrough + ACK kept alive)")
-    time.sleep(0.3)
-
-    # --- CAN-live gate -------------------------------------------------------
-    # bxCAN needs 11 consecutive RECESSIVE bits to leave initialisation. Start
-    # this stack while the car is off and CAN1 never gets them: it stays in init
-    # FOREVER. Turning the ignition on afterwards does not retrigger init, and
-    # neither does re-setting the safety mode (can_init_all cannot help a core
-    # that is already wedged) -- only a device reset does.
-    #
-    # The failure is silent and total, and it does NOT look like a bus problem:
-    #   MEASURED 2026-08-09, 543 s run -- CAN1 total_rx_cnt frozen at 5,263,945
-    #   (delta 0/s with the ignition on), TEC=0, REC=0, bus_off=0, last_error
-    #   "No error". Zero traffic AND zero errors, because a core in init neither
-    #   receives nor error-counts. Every carState field held its startup value
-    #   for the whole run, so v/rpm/angle read 0.0 and openpilot simply never
-    #   engaged with nothing in the log to say why.
-    #
-    # Worse, reception is not the only casualty. Forwarding runs inside can_rx(),
-    # so a wedged core also stops bridging cam<->bus0 -- and with no harness
-    # relay the panda is the only path between them. The cluster raised a front
-    # camera sensor fault, which looks exactly like the alpha-long radar
-    # suppression fault and sent me chasing the wrong cause.
-    #
-    # So probe before trusting the link, and reset if it is dead. 0xd8 is
-    # NVIC_SystemReset -- a firmware reboot, NOT a flash; it re-runs can_init
-    # against whatever the bus looks like now.
-    def _bus0_rate(pnd, dur=1.0):
-        pnd._buf = b''
-        t_end, n = time.monotonic() + dur, 0
-        while time.monotonic() < t_end:
-            for _a, _d, _b in pnd.can_recv():
-                if _b == 0:
-                    n += 1
-        return n / dur
-
-    rate = _bus0_rate(panda)
-    if rate == 0.0:
-        print("panda: bus 0 SILENT at startup -- CAN1 may be stuck in init; "
-              "resetting the board (0xd8) and retrying")
-        try:
-            panda.control_write(0xd8, 0, 0)
-        except Exception:
-            pass          # the reset tears the USB link down mid-transfer
-        try:
-            panda.close()
-        except Exception:
-            pass
-        time.sleep(4.0)
+    # Exactly one process may hold the USB handle; a second claim raises
+    # USBErrorBusy and takes the CAN link down with it. In the model role the
+    # panda is owned by the other process and carState arrives over msgq, so
+    # everything below is skipped and `panda` stays None. Every later use is
+    # guarded on owns_panda for the same reason.
+    if owns_panda:
         panda = UsbPanda()
+        # SAFETY_SILENT does NOT just stop transmitting -- it stops FORWARDING.
+        # nooutput_init() in opendbc/safety/modes/defaults.h returns
+        #     (safety_config){NULL, 0, NULL, 0, true}   // disable_forwarding = true
+        # and safety_fwd_hook() checks that first, returning -1 for every address.
+        #
+        # This build has NO harness relay (nucleo_harness_config), so the panda is the
+        # ONLY path between the forward camera on bus 2 and the car on bus 0. Silent
+        # mode therefore SEVERS them: the car sees no camera at all and raises a front
+        # camera sensor fault within seconds. A stock panda survives this because its
+        # relay re-bridges cam<->car whenever openpilot is not intercepting; we have no
+        # such fallback.
+        #
+        # So silent is the safe default only when the car is ASLEEP. With CAN ignition
+        # present, go straight to Mazda safety: it forwards and ACKs, and it commands
+        # nothing on its own -- the tx thread is what sends frames, and that only runs
+        # when armed. MEASURED 2026-08-07: the camera also needs the ACK. Left unacked
+        # it retransmits CAM_EMPTY at line rate (3656 Hz) and never reaches its real
+        # messages, because the panda is its only bus partner on that segment.
         panda.control_write(0xdc, SAFETY_NOOUTPUT, 0)
-        time.sleep(0.5)
-        rate = _bus0_rate(panda)
+        print("panda: startup safety = SAFETY_NOOUTPUT "
+              "(no transmit; cam<->car passthrough + ACK kept alive)")
+        time.sleep(0.3)
 
-    if rate == 0.0:
-        # A reset against a genuinely dead bus leaves the core wedged again, so
-        # this is not recoverable from here -- it needs the ignition on first.
-        print("panda: *** bus 0 STILL SILENT (%.0f frames/s) ***" % rate)
-        print("       The car is asleep, or the harness is not connected.")
-        print("       Turn the ignition ON, then restart this stack -- CAN1")
-        print("       cannot leave init against a dead bus, and starting now")
-        print("       means carState stays frozen and cam<->car forwarding")
-        print("       never runs (the cluster then reports a camera fault).")
+        # --- CAN-live gate -------------------------------------------------------
+        # bxCAN needs 11 consecutive RECESSIVE bits to leave initialisation. Start
+        # this stack while the car is off and CAN1 never gets them: it stays in init
+        # FOREVER. Turning the ignition on afterwards does not retrigger init, and
+        # neither does re-setting the safety mode (can_init_all cannot help a core
+        # that is already wedged) -- only a device reset does.
+        #
+        # The failure is silent and total, and it does NOT look like a bus problem:
+        #   MEASURED 2026-08-09, 543 s run -- CAN1 total_rx_cnt frozen at 5,263,945
+        #   (delta 0/s with the ignition on), TEC=0, REC=0, bus_off=0, last_error
+        #   "No error". Zero traffic AND zero errors, because a core in init neither
+        #   receives nor error-counts. Every carState field held its startup value
+        #   for the whole run, so v/rpm/angle read 0.0 and openpilot simply never
+        #   engaged with nothing in the log to say why.
+        #
+        # Worse, reception is not the only casualty. Forwarding runs inside can_rx(),
+        # so a wedged core also stops bridging cam<->bus0 -- and with no harness
+        # relay the panda is the only path between them. The cluster raised a front
+        # camera sensor fault, which looks exactly like the alpha-long radar
+        # suppression fault and sent me chasing the wrong cause.
+        #
+        # So probe before trusting the link, and reset if it is dead. 0xd8 is
+        # NVIC_SystemReset -- a firmware reboot, NOT a flash; it re-runs can_init
+        # against whatever the bus looks like now.
+        def _bus0_rate(pnd, dur=1.0):
+            pnd._buf = b''
+            t_end, n = time.monotonic() + dur, 0
+            while time.monotonic() < t_end:
+                for _a, _d, _b in pnd.can_recv():
+                    if _b == 0:
+                        n += 1
+            return n / dur
+
+        rate = _bus0_rate(panda)
+        if rate == 0.0:
+            print("panda: bus 0 SILENT at startup -- CAN1 may be stuck in init; "
+                  "resetting the board (0xd8) and retrying")
+            try:
+                panda.control_write(0xd8, 0, 0)
+            except Exception:
+                pass          # the reset tears the USB link down mid-transfer
+            try:
+                panda.close()
+            except Exception:
+                pass
+            time.sleep(4.0)
+            panda = UsbPanda()
+            panda.control_write(0xdc, SAFETY_NOOUTPUT, 0)
+            time.sleep(0.5)
+            rate = _bus0_rate(panda)
+
+        if rate == 0.0:
+            # A reset against a genuinely dead bus leaves the core wedged again, so
+            # this is not recoverable from here -- it needs the ignition on first.
+            print("panda: *** bus 0 STILL SILENT (%.0f frames/s) ***" % rate)
+            print("       The car is asleep, or the harness is not connected.")
+            print("       Turn the ignition ON, then restart this stack -- CAN1")
+            print("       cannot leave init against a dead bus, and starting now")
+            print("       means carState stays frozen and cam<->car forwarding")
+            print("       never runs (the cluster then reports a camera fault).")
+        else:
+            print("panda: bus 0 live at %.0f frames/s" % rate)
     else:
-        print("panda: bus 0 live at %.0f frames/s" % rate)
+        panda = None
+        print("panda: not opened (--role model); carState comes from the panda "
+              "role over msgq")
 
     # --- transmit path (only actually sends when armed) ---------------------
     packer = CANPacker('mazda_2017')
@@ -1459,13 +1484,105 @@ def pipeline(args):
     # sustains ~83 Hz under GIL contention with the model, which put selfdrived's
     # loop at ~12 ms (>11.1 ms) and raised selfdrivedLagging. A dedicated ~110 Hz
     # carState thread keeps selfdrived's loop under 10 ms.
-    main_pub = [t for t in avail if t != 'carState']
+    # SPLIT THE TOPICS BY ROLE, or the two processes fight over them.
+    #
+    # The publish loop runs in BOTH roles, and it sends every topic it was given
+    # whether or not this process produced the data behind it. Left alone, the
+    # panda role would publish an all-defaults modelV2, liveCalibration and
+    # livePose alongside the model role's real ones -- two publishers on one
+    # topic, with subscribers seeing whichever arrived last. selfdrived would
+    # then be reading a model output that flickers between real and empty, and
+    # nothing in either log would say why.
+    #
+    # These are the topics backed by panda-side state: pandaStates comes from
+    # health_state, which can_thread fills, and carOutput carries the torque
+    # actually applied, which only the tx thread knows. carState is handled
+    # separately through pm_cs. Everything else is model-side.
+    PANDA_TOPICS = {'pandaStates', 'carOutput'}
+    if role == "panda":
+        main_pub = [t for t in avail if t in PANDA_TOPICS]
+    elif role == "model":
+        main_pub = [t for t in avail if t != 'carState' and t not in PANDA_TOPICS]
+    else:
+        main_pub = [t for t in avail if t != 'carState']
     pm = messaging.PubMaster(main_pub)
-    pm_cs = messaging.PubMaster(['carState']) if 'carState' in avail else None
-    sm = messaging.SubMaster(['selfdriveState', 'carControl', 'onroadEvents'])
+    # Only the panda role publishes carState -- it is the process that decodes
+    # the bus. Two publishers on one topic would interleave a real carState with
+    # an all-defaults one and make engagement flap for reasons invisible in
+    # either log.
+    pm_cs = (messaging.PubMaster(['carState'])
+             if ('carState' in avail and owns_panda) else None)
+    _sub = ['selfdriveState', 'carControl', 'onroadEvents']
+    if role == "model":
+        # The model role does not own the panda, so nothing local decodes the bus.
+        # carState arrives from the panda role instead.
+        _sub.append('carState')
+    sm = messaging.SubMaster(_sub)
     time.sleep(0.4)
 
-    cs_can = CarStateFromCAN()
+    class _CarStateFromMsgq:
+        """CarStateFromCAN's attribute surface, fed from a subscribed carState.
+
+        WHY A SHIM RATHER THAN A REWRITE. cs_can is read at 45 sites outside the
+        CAN threads -- the model's v_ego, the angle-offset learner, the desire
+        helper, the display. Presenting the same attribute names means every one
+        of those keeps working untouched, so splitting the process cannot quietly
+        change what the model is fed.
+
+        Only the fields stock carState actually carries are mapped. The
+        Mazda-specific ones (acc_armed, eps_request, eps_effective, lkas_block,
+        hands_off_5s, buttons) have no home in the schema and are read ONLY by the
+        CAR diagnostic line -- which belongs to the panda role, because that is
+        the process holding the state. They keep their constructor defaults here
+        rather than being faked, so anything that starts reading them in this role
+        reads an obvious zero instead of a plausible lie.
+        """
+
+        def __init__(self):
+            self.v_ego = 0.0
+            self.cruise_available = False
+            self.cruise_enabled = False
+            self.acc_armed = False
+            self.acc_active = False
+            self.brake_pressed = False
+            self.gas_pressed = False
+            self.steering_torque = 0.0
+            self.steering_pressed = False
+            self.steering_angle = 0.0
+            self.steer_angle_rate = 0.0
+            self.rpm = 0
+            self.buttons = dict(set_p=0, set_m=0, res=0, off=0)
+            self.eps_motor_torque = 0.0
+            self.eps_request = 0
+            self.eps_effective = 0
+            self.lkas_block = False
+            self.hands_off_5s = False
+            self.lkas_track_state = 0
+            self.left_blinker = False
+            self.right_blinker = False
+            self.left_blindspot = False
+            self.right_blindspot = False
+            self.seen = 0
+            self.eps_seen = 0
+            self.crz_btns_counter = 0
+
+        def update_from(self, cs):
+            self.v_ego = float(cs.vEgo)
+            self.steering_angle = float(cs.steeringAngleDeg)
+            self.steer_angle_rate = float(cs.steeringRateDeg)
+            self.steering_torque = float(cs.steeringTorque)
+            self.steering_pressed = bool(cs.steeringPressed)
+            self.brake_pressed = bool(cs.brakePressed)
+            self.gas_pressed = bool(cs.gasPressed)
+            self.cruise_available = bool(cs.cruiseState.available)
+            self.cruise_enabled = bool(cs.cruiseState.enabled)
+            self.left_blinker = bool(cs.leftBlinker)
+            self.right_blinker = bool(cs.rightBlinker)
+            self.left_blindspot = bool(cs.leftBlindspot)
+            self.right_blindspot = bool(cs.rightBlindspot)
+            self.seen += 1
+
+    cs_can = _CarStateFromMsgq() if role == "model" else CarStateFromCAN()
     # engagement edge tracker; see the EDGE print in the publish loop
     edge = {"prev": None, "n": 0, "last": "-"}
     diag = {"t": 0.0}   # 1 Hz CAR/EVT diagnostic tick
@@ -3530,10 +3647,16 @@ def pipeline(args):
         threading.Thread(target=seg_thread, daemon=True).start()
     if not args.no_depth:
         threading.Thread(target=depth_thread, daemon=True).start()
-    threading.Thread(target=can_thread, daemon=True).start()
+    # Both of these talk to the panda directly, so they belong to whichever
+    # process owns the handle. In the model role carState is subscribed instead
+    # of decoded (see _CarStateFromMsgq), and publishing it from here as well
+    # would put two writers on one topic.
+    if owns_panda:
+        threading.Thread(target=can_thread, daemon=True).start()
     if not can_only:
         threading.Thread(target=model_thread, daemon=True).start()
-    threading.Thread(target=carstate_thread, daemon=True).start()
+    if owns_panda:
+        threading.Thread(target=carstate_thread, daemon=True).start()
 
     # Checked whether or not we arm: in dashcam mode it is a free warning that the
     # tree has drifted, which is exactly when you want to know rather than on the
@@ -4058,6 +4181,15 @@ def pipeline(args):
             sm.update(0)
             ss, cc = sm['selfdriveState'], sm['carControl']
 
+            # In the model role nothing local decodes the bus, so refresh the
+            # cs_can shim from the carState the panda role publishes. Done right
+            # after sm.update so every consumer below -- the model's v_ego, the
+            # angle-offset learner, the desire helper, the display -- sees the
+            # same snapshot within one loop, exactly as when cs_can was written
+            # in-process by can_thread.
+            if role == "model" and sm.updated.get('carState'):
+                cs_can.update_from(sm['carState'])
+
             # hand controlsd's latest decision to the tx thread (every loop).
             # actuators.curvature is the POST-clip_curvature desired curvature --
             # the one the lateral controller targets -- not the raw model output,
@@ -4528,10 +4660,11 @@ def pipeline(args):
         # with no supervisor until the next process arms it or the car sleeps.
         # Nothing transmits, but the safety net is a relay this build does not have.
         try:
-            with panda_lock:
-                panda.control_write(0xdc, SAFETY_NOOUTPUT, 0)
-            print("panda: transmit stopped; safety left at SAFETY_NOOUTPUT "
-                  "(cam<->car passthrough kept alive, nothing transmittable)")
+            if owns_panda:
+                with panda_lock:
+                    panda.control_write(0xdc, SAFETY_NOOUTPUT, 0)
+                print("panda: transmit stopped; safety left at SAFETY_NOOUTPUT "
+                      "(cam<->car passthrough kept alive, nothing transmittable)")
         except Exception as e:
             print(f"panda: could NOT re-assert safety mode ({e}) -- power-cycle before driving")
         time.sleep(0.25)

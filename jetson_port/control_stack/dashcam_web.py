@@ -237,6 +237,16 @@ SAFETY_MAZDA = 13         # CarParams.SafetyModel.mazda -- enforced in panda fir
 # fabricated -- faking those would let the car believe AEB is working on invented
 # measurements, which is worse than the warning it currently shows.
 RADAR_IDS = (0x361, 0x362, 0x363, 0x364, 0x365, 0x366, 0x499)
+# Of those seven, these five carry a 4-bit rolling counter and the other two do
+# not. Verified against mazda_2017.dbc: 0x361 is CTR 56|4@1+ (Intel) and
+# 0x362-0x365 are CTR 59|4@0+ (Motorola) -- different byte orders that both
+# resolve to the LOW NIBBLE OF BYTE 7, so one rule covers all five. 0x366 has no
+# CTR signal at all and 0x499 has no signals defined, so both replay verbatim.
+#
+# None of the seven carries a checksum. That is the single fact that makes replay
+# worth attempting: there is no reverse-engineered formula to get wrong, only a
+# counter to keep moving.
+RADAR_CTR_IDS = (0x361, 0x362, 0x363, 0x364, 0x365)
 RADAR_NAMES = {0x361: "DISTANCE", 0x362: "TURN", 0x363: "363", 0x364: "364",
                0x365: "365", 0x366: "366_STATIC", 0x499: "499_STATIC"}
 # See the block in carstate_thread() where this is applied.
@@ -1384,6 +1394,21 @@ def pipeline(args):
         # ck_skip is therefore the cheap pre-test: run a drive with the flag OFF
         # and if ck_skip stays 0, this camera never sets these bits at all, the
         # copy would be a no-op, and the front camera fault has another cause.
+        # WHICH bit forces the skip, counted separately.
+        #
+        # ck_skip lumps three signals together, and MEASURED 2026-08-09 it was
+        # 1869 out of 1869 -- every camera frame skipped, so ck_ok was 0 and our
+        # 0x243 packing went completely unvalidated for the whole run. "All of
+        # them" is useless on its own: OP_LKAS_COPY_CAM_LINES copies
+        # LINE_NOT_VISIBLE and LDW but NOT ANGLE_ENABLED, so if b2 is the bit
+        # actually being set the flag cannot help and enabling it would prove
+        # nothing. Split the counter so the next run says which.
+        if lnv:
+            cam_state["ck_lnv"] = cam_state.get("ck_lnv", 0) + 1
+        if ldw:
+            cam_state["ck_ldw"] = cam_state.get("ck_ldw", 0) + 1
+        if b2:
+            cam_state["ck_ang"] = cam_state.get("ck_ang", 0) + 1
         _cmp_lines = getattr(mazdacan, "_COPY_CAM_LINES", False)
         if b2 or ((lnv or ldw) and not _cmp_lines):
             cam_state["ck_skip"] += 1
@@ -1626,7 +1651,8 @@ def pipeline(args):
     # engagement edge tracker; see the EDGE print in the publish loop
     edge = {"prev": None, "n": 0, "last": "-"}
     diag = {"t": 0.0}   # 1 Hz CAR/EVT diagnostic tick
-    radar_shadow = {}   # addr -> {n, d, t}, see RADAR_IDS
+    radar_shadow = {}   # addr -> {n, d, t, t0}, see RADAR_IDS
+    radar_shadow_state = {"sent": 0}   # frames replayed, surfaced in the log
     ang_off = {"v": 0.0, "n": 0}   # learned steering angle offset, deg
     import collections as _c
     lat_trace = {"on": os.environ.get("OP_LAT_TRACE") == "1", "t": 0.0,
@@ -1858,8 +1884,15 @@ def pipeline(args):
                     # really do go silent under suppression and (b) replay the
                     # static ones to keep the camera satisfied. See RADAR_IDS.
                     if addr in RADAR_IDS and len(d) == 8:
-                        _r = radar_shadow.setdefault(addr, {"n": 0, "d": b"", "t": 0.0})
-                        _r["n"] += 1; _r["d"] = bytes(d); _r["t"] = time.time()
+                        # t0 is first-seen, so the replay can derive each frame's
+                        # real rate as (n-1)/(t-t0) rather than guessing. Guessing
+                        # is not harmless: send these faster than the radar did and
+                        # the bus gains load that was never there; slower, and a
+                        # consumer watching for a timeout still sees one.
+                        _now_r = time.time()
+                        _r = radar_shadow.setdefault(
+                            addr, {"n": 0, "d": b"", "t": 0.0, "t0": _now_r})
+                        _r["n"] += 1; _r["d"] = bytes(d); _r["t"] = _now_r
                     if uds_sniff["on"] and addr in uds_sniff["addrs"]:
                         uds_sniff["q"].append((addr, bytes(d), bus))
                         uds_sniff["seen"] += 1
@@ -3364,6 +3397,86 @@ def pipeline(args):
                 finally:
                     tx_due.clear()
 
+    def radar_shadow_thread():
+        """Replay the radar's OTHER seven frames while it is suppressed.
+
+        Alpha long silences the radar to take over 0x21b/0x21c, but the radar also
+        sends 0x361-0x366 and 0x499, which we do NOT replace. Those simply vanish,
+        and the forward camera -- which normally receives them -- is the module
+        that reports "front camera sensor" on the cluster.
+
+        Silencing it more politely is not an option: MEASURED 2026-08-09, this
+        radar refuses CommunicationControl (0x28) and both the extended and
+        safety-system diagnostic sessions, answering none of them, while accepting
+        the programming session instantly. So the radar goes fully mute whatever we
+        do, and the only remaining lever is to put its other frames back ourselves.
+
+        Replay is only credible because these frames carry NO CHECKSUM. Five have a
+        4-bit counter in the low nibble of byte 7 and two are static, so a replayed
+        frame is indistinguishable from a real one except for its CONTENT, which is
+        frozen at whatever the radar last said before it went quiet.
+
+        THAT IS THE PART THAT MAY NOT WORK, and it is worth being honest about:
+        0x361 carries DISTANCE_LEAD and RELATIVE_VEL_LEAD. If the camera checks
+        those against its own vision, a frozen lead that never moves is exactly the
+        kind of implausibility a sensor-fusion check exists to catch, and we will
+        have traded one fault for another. Capture with nothing ahead if you can --
+        a "no target" snapshot is the least likely to contradict anything.
+        """
+        plan = []
+        for _addr in RADAR_IDS:
+            _r = radar_shadow.get(_addr)
+            if not _r or not _r.get("d") or _r["n"] < 5:
+                continue
+            # Rate from the capture window, not a constant. n-1 intervals span
+            # t-t0, and a window shorter than half a second is too little to
+            # divide by.
+            _span = _r["t"] - _r.get("t0", _r["t"])
+            _hz = (_r["n"] - 1) / _span if _span > 0.5 else 0.0
+            if _hz < 1.0:
+                continue
+            plan.append({"addr": _addr, "d": bytearray(_r["d"]),
+                         "period": 1.0 / _hz, "next": time.time(),
+                         "ctr": _r["d"][7] & 0x0F,
+                         "has_ctr": _addr in RADAR_CTR_IDS})
+
+        if not plan:
+            print("radar shadow: NOTHING CAPTURED -- the radar was already quiet "
+                  "before suppression, so there is nothing to replay. The camera "
+                  "fault (if any) is not explained by these frames.")
+            return
+        print("radar shadow: replaying %d frame(s) -- %s"
+              % (len(plan), ", ".join("0x%03x@%.0fHz%s"
+                                      % (p["addr"], 1.0 / p["period"],
+                                         "+ctr" if p["has_ctr"] else "")
+                                      for p in plan)))
+
+        sent = 0
+        while not stop_flag["v"]:
+            now = time.time()
+            for p in plan:
+                if now < p["next"]:
+                    continue
+                if p["has_ctr"]:
+                    p["ctr"] = (p["ctr"] + 1) & 0x0F
+                    p["d"][7] = (p["d"][7] & 0xF0) | p["ctr"]
+                try:
+                    with panda_lock:
+                        panda.can_send(p["addr"], bytes(p["d"]), 0)
+                    sent += 1
+                except Exception:
+                    pass
+                # Advance by whole periods rather than from `now`, so a late wake
+                # does not permanently shift this frame's phase. If we have fallen
+                # more than a period behind, resynchronise instead of trying to
+                # catch up with a burst -- a burst is more suspicious to a
+                # consumer than a missed frame.
+                p["next"] += p["period"]
+                if p["next"] < now:
+                    p["next"] = now + p["period"]
+            radar_shadow_state["sent"] = sent
+            time.sleep(0.002)
+
     def carstate_thread():
         # Publish carState at a steady ~110 Hz. selfdrived's loop is gated by a
         # blocking recv_one(carState, 20ms), so this rate IS selfdrived's loop rate;
@@ -3886,6 +3999,11 @@ def pipeline(args):
             # UDS session is a real change to the car's state and should not happen
             # in dashcam mode.
             threading.Thread(target=long_tx_thread, daemon=True).start()
+            # Put the radar's OTHER seven frames back. Started only
+            # alongside alpha long, because the panda only accepts them
+            # under mazda_longitudinal -- outside it they would be
+            # rejected, which is the right failure direction.
+            threading.Thread(target=radar_shadow_thread, daemon=True).start()
             print(">>> ALPHA LONG ACTIVE: 0x21b/0x21c at 50 Hz, radar tester-present "
                   "at 2 Hz.\n    FCW / AEB / SBS ARE OFF while this runs.\n")
         elif alpha_long:
@@ -4369,7 +4487,7 @@ def pipeline(args):
                       "| drv_trq=%+6.1f pressed=%d angle=%+7.2f "
                       "| eps_req=%+5d eps_eff=%+5d lkas_block=%d hands_off=%d "
                       "| blink=%d/%d bsm=%d/%d "
-                      "| cam_seen=%d cam_age=%.1fs lane_age=%.1fs ck=%d/%d/%d "
+                      "| cam_seen=%d cam_age=%.1fs lane_age=%.1fs ck=%d/%d/%d(l%d,d%d,a%d) "
                       "| mpc=%d mv=%.1f/%.1f ma=%+.2f a_raw=%+.2f a_cmd=%+.2f lim=%-10s "
                       "| txgap=%.0f/%.0fms late=%d "
                       "| ang_off=%+.2f(%d) "
@@ -4397,6 +4515,13 @@ def pipeline(args):
                          # is something else.
                          int(cam_state.get("ck_ok", 0)), int(cam_state.get("ck_bad", 0)),
                          int(cam_state.get("ck_skip", 0)),
+                         # which bit forced the skip: LINE_NOT_VISIBLE, LDW,
+                         # ANGLE_ENABLED. OP_LKAS_COPY_CAM_LINES only copies the
+                         # first two, so a run dominated by 'a' means the flag
+                         # cannot fix the mismatch.
+                         int(cam_state.get("ck_lnv", 0)),
+                         int(cam_state.get("ck_ldw", 0)),
+                         int(cam_state.get("ck_ang", 0)),
                          int(_gov.get("mpc", 0)),
                          float(_mpc_state["v"]) * 3.6, float(cs_can.v_ego) * 3.6,
                          float(_mpc_state["a"]),

@@ -28,6 +28,7 @@ from openpilot.common.hardware import HARDWARE
 REPLAY = "REPLAY" in os.environ
 SIMULATION = "SIMULATION" in os.environ
 TESTING_CLOSET = "TESTING_CLOSET" in os.environ
+JETSON_CAMERA_BYPASS = "JETSON_CAMERA_BYPASS" in os.environ
 
 LONGITUDINAL_PERSONALITY_MAP = {v: k for k, v in log.LongitudinalPersonality.schema.enumerants.items()}
 
@@ -83,6 +84,13 @@ class SelfdriveD:
     if REPLAY:
       # no vipc in replay will make them ignored anyways
       ignore += ['roadCameraState', 'wideRoadCameraState']
+    if JETSON_CAMERA_BYPASS:
+      # This Jetson feeds supercombo straight from the IMX477; the cereal camera
+      # state topics (roadCameraState/driverCameraState/wideRoadCameraState) are
+      # never published in this architecture, so they read as not_alive and would
+      # raise commIssue, blocking engagement. Exempt them from alive/freq/valid --
+      # this is the same reason SIMULATION/REPLAY exempt cameras above.
+      ignore += self.camera_packets
     self.sm = messaging.SubMaster(['deviceState', 'pandaStates', 'peripheralState', 'modelV2', 'liveCalibration',
                                    'carOutput', 'driverMonitoringState', 'longitudinalPlan', 'livePose', 'liveDelay',
                                    'managerState', 'liveParameters', 'radarState', 'liveTorqueParameters',
@@ -96,6 +104,32 @@ class SelfdriveD:
     self.is_metric = self.params.get_bool("IsMetric")
     self.is_ldw_enabled = self.params.get_bool("IsLdwEnabled")
     self.disengage_on_accelerator = self.params.get_bool("DisengageOnAccelerator")
+    # BRAKE DISENGAGE, made optional for MADS (Jetson port).
+    #
+    # Stock gates the accelerator on DisengageOnAccelerator but gates the brake on
+    # nothing at all -- braking always raises pedalPressed, and while moving the
+    # condition is level-triggered rather than edge-triggered, so it re-fires for
+    # as long as the pedal is down.
+    #
+    # That is the right default and it stays the default here. It is also
+    # incompatible with what MADS is for. MADS exists so the driver can work the
+    # pedals while lateral keeps steering; with the brake still disengaging,
+    # lateral drops out at exactly the moments the driver most wants it -- every
+    # slowdown, every junction, every roundabout.
+    #
+    # It is specifically what stops the car TURNING. pick_desire only issues
+    # turnLeft/turnRight while lat_active is true, and you brake to take a turn,
+    # so the desire is suppressed at precisely the moment it is needed.
+    #
+    # MEASURED over one 1583 s drive: ALL TWELVE transitions to disabled had
+    # brake=1. Not most of them, all of them -- nothing else disengaged the stack
+    # that whole drive.
+    #
+    # Env var rather than a Param: adding a Param means registering a key in
+    # params_keys, and this only has to reach a daemon that dashcam_web already
+    # spawns with a prepared env. Defaults to stock, so a run that does not set it
+    # behaves exactly as before.
+    self.disengage_on_brake = os.environ.get("OP_DISENGAGE_ON_BRAKE", "1") == "1"
 
     car_recognized = self.CP.brand != 'mock'
 
@@ -225,8 +259,8 @@ class SelfdriveD:
 
       # Disable on rising edge of accelerator or brake. Also disable on brake when speed > 0
       if (CS.gasPressed and not self.CS_prev.gasPressed and self.disengage_on_accelerator) or \
-        (CS.brakePressed and (not self.CS_prev.brakePressed or not CS.standstill)) or \
-        (CS.regenBraking and (not self.CS_prev.regenBraking or not CS.standstill)):
+        (CS.brakePressed and self.disengage_on_brake and (not self.CS_prev.brakePressed or not CS.standstill)) or \
+        (CS.regenBraking and self.disengage_on_brake and (not self.CS_prev.regenBraking or not CS.standstill)):
         self.events.add(EventName.pedalPressed)
 
     # Create events for temperature, disk space, and memory
@@ -328,7 +362,7 @@ class SelfdriveD:
     if self.sm.recv_frame['managerState'] and not_running:
       self.events.add(EventName.processNotRunning)
     else:
-      if not SIMULATION and not self.rk.lagging:
+      if not SIMULATION and not JETSON_CAMERA_BYPASS and not self.rk.lagging:
         if not self.sm.all_alive(self.camera_packets):
           self.events.add(EventName.cameraMalfunction)
         elif not self.sm.all_freq_ok(self.camera_packets):
@@ -371,7 +405,7 @@ class SelfdriveD:
     else:
       self.logged_comm_issue = None
 
-    if not self.CP.notCar:
+    if not self.CP.notCar and not JETSON_CAMERA_BYPASS:
       if not self.sm['livePose'].posenetOK:
         self.events.add(EventName.posenetInvalid)
       if not self.sm['livePose'].inputsOK:
@@ -380,7 +414,10 @@ class SelfdriveD:
         self.events.add(EventName.paramsdTemporaryError)
 
     # conservative HW alert. if the data or frequency are off, locationd will throw an error
-    if any((self.sm.frame - self.sm.recv_frame[s])*DT_CTRL > 10. for s in self.sensor_packets):
+    if not JETSON_CAMERA_BYPASS and any(
+      (self.sm.frame - self.sm.recv_frame[s]) * DT_CTRL > 10.
+      for s in self.sensor_packets
+    ):
       self.events.add(EventName.sensorDataInvalid)
 
     if not REPLAY:

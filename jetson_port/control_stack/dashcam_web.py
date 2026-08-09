@@ -1453,6 +1453,22 @@ def pipeline(args):
         # ONLY those liveness checks; calibrationIncomplete still gates engagement,
         # and the panda's own Mazda safety limits are untouched.
         env["JETSON_CAMERA_BYPASS"] = "1"
+        # Under MADS the brake must not disengage lateral. Stock gates the
+        # accelerator on DisengageOnAccelerator (set above) but gates the brake on
+        # nothing, so lateral dropped out on every slowdown -- MEASURED over one
+        # 1583 s drive, all TWELVE transitions to disabled had brake=1, and
+        # nothing else disengaged the stack at all.
+        #
+        # It is also what stops the car TURNING: pick_desire only issues
+        # turnLeft/turnRight while lat_active is true, and you brake to take a
+        # turn, so the desire is suppressed exactly when it is wanted.
+        #
+        # NOTE this only lifts openpilot's half of the gate. The panda enforces
+        # its own -- mazda.h does `controls_allowed = cruise_engaged &&
+        # !brake_pressed` -- so until that build changes, the firmware still
+        # refuses torque while the brake is down and lateral will still drop.
+        if mads:
+            env["OP_DISENGAGE_ON_BRAKE"] = "0"
         daemon_core = {"openpilot.selfdrive.selfdrived.selfdrived": "4",
                        "openpilot.selfdrive.controls.controlsd": "5"}
         for mod in ("openpilot.selfdrive.selfdrived.selfdrived",

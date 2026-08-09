@@ -3586,8 +3586,29 @@ def pipeline(args):
                 # to cycle MRCC MAIN. Dropping it on brake gives the edge back:
                 # press to disengage, release to re-engage, which is what mazda.h
                 # now does with controls_allowed so the two stay in step.
+                # ALPHA LONG MUST USE acc_armed TOO, not acc_active.
+                #
+                # acc_active is the stock ACC reporting itself engaged -- and the
+                # stock ACC lives in the radar, which alpha long has just muted.
+                # Keying engagement off it is circular: we suppress the ACC ECU and
+                # then wait for the ACC to say it is active, which it never can.
+                #
+                # MEASURED 2026-08-09 over 595 samples / 596 s of a live alpha-long
+                # run: acc_active NEVER set once, while acc_armed was set for 445
+                # of them and the panda's own controls_allowed was true for 400.
+                # The panda was willing the whole time; only this line was not, and
+                # because nothing was REFUSING, openpilot logged no events at all --
+                # op=disabled with an empty EVT line, which is the hardest possible
+                # symptom to trace.
+                #
+                # The panda already resolved this: mazda.h:210 gates alpha long on
+                # `acc_armed && !brake`, where acc_armed comes from PEDALS, chosen
+                # precisely because PEDALS stays truthful with the radar silent.
+                # Use the same signal here so the two halves of the stack agree --
+                # a host that engages on a different flag than the panda enforces is
+                # a disagreement waiting to surface as exactly this.
                 cs.cruiseState.enabled = ((cs_can.acc_armed and not cs_can.brake_pressed)
-                                          if mads else cs_can.acc_active)
+                                          if (mads or alpha_long) else cs_can.acc_active)
             else:
                 # MADS engagement edge, WITHOUT disengaging on every brake.
                 #

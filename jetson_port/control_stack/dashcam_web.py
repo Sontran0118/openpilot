@@ -1429,6 +1429,32 @@ def pipeline(args):
             return
         ck_ok = bytes(ref[1]) == bytes(d)
         cam_state["ck_ok" if ck_ok else "ck_bad"] += 1
+        # KEEP THE FRAMES THAT FAIL, not just a count.
+        #
+        # MEASURED 2026-08-09: ck = 7056/43/10155 -- 43 of 7099 comparable frames
+        # (0.6%) did NOT reproduce byte-for-byte. That is not a validation
+        # curiosity: create_steering_control is the SAME code that builds what we
+        # transmit, so whatever input it mis-packs here, it also mis-packs on the
+        # wire, and the EPS rejects those frames. It lines up with lkas_block
+        # flapping and tx_blocked climbing.
+        #
+        # A count cannot say WHICH input breaks it. The prime suspect is the
+        # STEERING_ANGLE path -- the checksum carries a bare `if ahi == 1:
+        # csum += 15` fudge that this file's own docstring admits was only ever
+        # fitted against captures, and ahi is always 2 when the angle is 0. So
+        # record the raw frame, our attempt, and the decoded fields, and let the
+        # difference name itself.
+        if not ck_ok and len(cam_state.setdefault("ck_bad_frames", [])) < 40:
+            _tmp = ang + 2048
+            cam_state["ck_bad_frames"].append({
+                "cam": bytes(d).hex(),
+                "ours": bytes(ref[1]).hex(),
+                "ang": ang,
+                "ahi": _tmp >> 10,          # the nibble the fudge keys on
+                "torque": torque,
+                "ctr": d[0] >> 4,
+                "csum_cam": d[7] if len(d) > 7 else None,
+            })
         if ang != 0:
             cam_state["ck_angle_seen"] += 1
         # Only trust the torque from a frame we can reproduce byte-for-byte --
@@ -4611,6 +4637,28 @@ def pipeline(args):
                             _parts.append("%s:%d age=%.1fs %s" % (RADAR_NAMES[_a], _r["n"],
                                           now - _r["t"], _r["d"].hex()))
                     print("RADAR %7.2fs %s" % (now - t0, "  ".join(_parts)), flush=True)
+
+                    # CKBAD -- the frames our own packer got wrong.
+                    #
+                    # Printed on the same slow tick as RADAR because it is rare and
+                    # only interesting in aggregate. Each row is the camera's frame,
+                    # ours built from the SAME decoded fields, and the fields
+                    # themselves. Wherever those two hex strings differ is a byte
+                    # create_steering_control computes wrong -- and since that is the
+                    # function that builds what we TRANSMIT, it is a byte the EPS
+                    # sees wrong too.
+                    _bad = cam_state.get("ck_bad_frames") or []
+                    if _bad and not cam_state.get("ck_bad_shown"):
+                        cam_state["ck_bad_shown"] = True
+                        print("CKBAD  %d captured (ok=%d bad=%d). cam vs ours:"
+                              % (len(_bad), cam_state.get("ck_ok", 0),
+                                 cam_state.get("ck_bad", 0)), flush=True)
+                        for _f in _bad[:12]:
+                            _diff = [i for i in range(8)
+                                     if _f["cam"][2 * i:2 * i + 2] != _f["ours"][2 * i:2 * i + 2]]
+                            print("   cam=%s ours=%s  ang=%-6d ahi=%d trq=%-5d ctr=%-2d  differs@bytes %s"
+                                  % (_f["cam"], _f["ours"], _f["ang"], _f["ahi"],
+                                     _f["torque"], _f["ctr"], _diff), flush=True)
 
             # STATE + log at ~20 Hz -- the phone and the jsonl don't need 100 Hz,
             # and writing every loop would bloat the trace 5x.

@@ -237,6 +237,13 @@ SAFETY_MAZDA = 13         # CarParams.SafetyModel.mazda -- enforced in panda fir
 # fabricated -- faking those would let the car believe AEB is working on invented
 # measurements, which is worse than the warning it currently shows.
 RADAR_IDS = (0x361, 0x362, 0x363, 0x364, 0x365, 0x366, 0x499)
+# Where the panda role publishes its own status for the model role's web UI.
+# See the writer at the 1 Hz diagnostic tick. Not /tmp: systemd-tmpfiles wipes
+# it at boot, and a status file that vanishes is worse than one that is stale,
+# because a missing file reads as 'no panda role' rather than 'panda role from
+# an earlier boot'.
+PANDA_STATUS_FILE = os.environ.get(
+    "OP_PANDA_STATUS_FILE", "/home/tran/drivelogs/panda_status.json")
 # Of those seven, these five carry a 4-bit rolling counter and the other two do
 # not. Verified against mazda_2017.dbc: 0x361 is CTR 56|4@1+ (Intel) and
 # 0x362-0x365 are CTR 59|4@0+ (Motorola) -- different byte orders that both
@@ -1046,25 +1053,55 @@ def overlay(frame, st, src_wh=None, minimal=False):
         f"calib {' '.join(f'{x*57.2958:+.2f}' for x in st['calib_rpy'])} deg  n={st['calib_samples']}",
         f"curv {st['curvature']:+.5f}   torque {st['would_command_torque']:+.3f}",
         # + = camera is RIGHT of lane centre. Blank until the model sees two lines.
+        #
+        # SPLIT ACROSS TWO LINES so the HUD can be scaled up. As one line this was
+        # 939 px wide at scale 1.4 and set the ceiling for the whole overlay --
+        # everything else had to stay small so this one line would fit. Two short
+        # lines cost one row of height and let the text grow until the SHORTER
+        # lines bind instead, which is the right trade on a dash monitor read at
+        # arm's length.
         (f"lane off {st['lane_off_m']:+.2f}m @0m  {st['lane_off_near_m']:+.2f}m @6.8m"
-         f"   width {st['lane_width_m']:.2f}m  p {st['lane_p_left']:.2f}/{st['lane_p_right']:.2f}"
          if st.get("lane_off_m") is not None else "lane off  --  (no lane lines)"),
+        (f"   width {st['lane_width_m']:.2f}m  p {st['lane_p_left']:.2f}/{st['lane_p_right']:.2f}"
+         if st.get("lane_off_m") is not None else ""),
         f"{st['op_state']}  cruise={'ENG' if st['cruise_enabled'] else ('avail' if st['cruise_available'] else 'off')}",
         # Headroom. --display serves no web page, so without this line the peak
         # counters are invisible in the one mode you actually watch while driving.
         # applied/STEER_MAX pinned at 100% means the ceiling is what binds and
         # raising it did something; well short of it means the ramp or the tune
         # binds instead and the higher ceiling is dead weight.
+        # Split for the same reason as the lane line: as one string this was the
+        # widest row on the HUD and capped how large everything could be drawn.
         (f"trq {st.get('applied_torque', 0):+5d} peak {st.get('applied_peak', 0)}"
-         f"/{st.get('steer_max', 0)} want {st.get('want_peak', 0)}"
-         f"  {st.get('lkas_hz', 0.0):.0f}Hz={st.get('ramp_cps', 0):.0f}c/s"
+         f"/{st.get('steer_max', 0)} want {st.get('want_peak', 0)}"),
+        (f"   {st.get('lkas_hz', 0.0):.0f}Hz={st.get('ramp_cps', 0):.0f}c/s"
          f"  cam {st.get('cam_trq_peak', 0)}"),
     ]
-    y = 24
+    # HUD SIZE. 0.6 was sized for a phone held close on the web preview; on the
+    # dash monitor at arm's length while driving it is unreadable, which defeats
+    # the point of the mode -- warnings you cannot read at a glance are warnings
+    # you do not act on.
+    #
+    # Everything scales together: glyph size, both stroke widths and the line
+    # pitch. Scaling only the font makes the lines collide, and scaling only the
+    # pitch leaves the text small with gaps. The outline stroke has to grow too or
+    # thin green text disappears against a bright road.
+    # 2.2 puts the glyphs at ~30 px against the original 14, which is what a dash
+    # monitor read at arm's length needs. It only fits because the two longest
+    # rows were split above: as single lines they measured 939 px of a 960 px
+    # frame at scale 1.4 and capped the whole overlay. Split, the widest row is
+    # ~852 px and the block ~422 px of 540 at this scale, so both dimensions still
+    # have margin. 2.4 is about the ceiling before rows start clipping.
+    _hud = float(os.environ.get("OP_HUD_SCALE", "2.2"))
+    _fs = 0.6 * _hud
+    _out = max(4, int(round(4 * _hud)))       # black outline, drawn first
+    _thk = max(1, int(round(1.6 * _hud)))     # the green glyph itself
+    _pitch = int(round(24 * _hud))
+    y = _pitch
     for line in txt:
-        cv2.putText(img, line, (10, y), cv2.FONT_HERSHEY_SIMPLEX, 0.6, (0, 0, 0), 4, cv2.LINE_AA)
-        cv2.putText(img, line, (10, y), cv2.FONT_HERSHEY_SIMPLEX, 0.6, (0, 255, 120), 1, cv2.LINE_AA)
-        y += 24
+        cv2.putText(img, line, (10, y), cv2.FONT_HERSHEY_SIMPLEX, _fs, (0, 0, 0), _out, cv2.LINE_AA)
+        cv2.putText(img, line, (10, y), cv2.FONT_HERSHEY_SIMPLEX, _fs, (0, 255, 120), _thk, cv2.LINE_AA)
+        y += _pitch
     return img
 
 
@@ -1265,7 +1302,58 @@ def pipeline(args):
                         n += 1
             return n / dur
 
-        rate = _bus0_rate(panda)
+        def _hw_vs_host(pnd, dur=1.0):
+            """(frames the SILICON received, frames that reached us) over dur.
+
+            THE FAILURE THIS CATCHES, and it cost most of a debugging session.
+            The panda's CAN cores keep receiving at full rate while the USB
+            stream to the host wedges, so can_recv returns a trickle -- 2, 10,
+            22 frames/s against a bus carrying 2800. Every symptom then looks
+            like the CAR: v=0, rpm=0, ignition MISSING, cam_seen=0, cruise
+            unavailable. It is indistinguishable from a sleeping car unless you
+            compare against the hardware counter, which is the one number that
+            keeps counting through it.
+            MEASURED 2026-08-10: CAN1 total_rx_cnt climbing +2330/s while the
+            host saw 4/s. That was read as "car asleep" repeatedly, and produced
+            a dead-camera diagnosis, a connector hunt and a cruise-refusal
+            theory -- all of them artefacts of this one fault.
+            The gate below only asked "is the host seeing anything?", so a
+            trickle passed it. Ask the silicon too.
+            """
+            try:
+                h0 = pnd.p.can_health(0)["total_rx_cnt"]
+            except Exception:
+                return None, _bus0_rate(pnd, dur)
+            host = _bus0_rate(pnd, dur)
+            try:
+                h1 = pnd.p.can_health(0)["total_rx_cnt"]
+            except Exception:
+                return None, host
+            return (h1 - h0) / dur, host
+
+        hw_rate, rate = _hw_vs_host(panda)
+        # Hardware busy but nothing reaching us -> the link is wedged, not the bus.
+        # A board reset is the only thing that reliably clears it; can_reset_
+        # communications alone has been observed not to.
+        if hw_rate is not None and hw_rate > 200.0 and rate < 0.25 * hw_rate:
+            print("panda: LINK WEDGED -- silicon is receiving %.0f frames/s but only "
+                  "%.0f/s reach the host. Resetting the board." % (hw_rate, rate))
+            try:
+                panda.control_write(0xd8, 0, 0)
+            except Exception:
+                pass
+            try:
+                panda.close()
+            except Exception:
+                pass
+            time.sleep(4.0)
+            panda = UsbPanda()
+            panda.control_write(0xdc, SAFETY_NOOUTPUT, 0)
+            time.sleep(0.5)
+            hw_rate, rate = _hw_vs_host(panda)
+            print("panda: after reset -- silicon %.0f/s, host %.0f/s"
+                  % (hw_rate if hw_rate is not None else -1, rate))
+
         if rate == 0.0:
             print("panda: bus 0 SILENT at startup -- CAN1 may be stuck in init; "
                   "resetting the board (0xd8) and retrying")
@@ -1506,10 +1594,37 @@ def pipeline(args):
     # ~290 Hz, so it was starved of CPU, not of messages). Pin this process (model
     # inference + 250 Hz publisher) to cores 0-3 and give each RT daemon its own
     # core: selfdrived -> 4, controlsd -> 5.
+    #
+    # ROLE-AWARE SINCE THE TWO-PROCESS SPLIT. The allocation above was written for
+    # the single-process build, where cores 0-3 held camera + model + panda and the
+    # two RT daemons got 4 and 5. After the split this same line ran in BOTH roles,
+    # so the panda role pinned itself to 0-3 alongside a model role measured at
+    # 156% CPU, and the one loop with a hard deadline was the only one with no core
+    # of its own.
+    #
+    # That deadline is real and it is short. can_rx_q holds 2048 frames and bus 0
+    # carries ~2873 frames/s, so the host has 0.71 s to get back to bulkRead before
+    # the queue overflows -- and overflow does not degrade gracefully, it tears the
+    # USB framing and ends in a silently frozen carState (v/angle pinned, cam_age
+    # climbing, nothing logged). MEASURED 2026-08-11 with both roles on 0-3 and
+    # loadavg 7.57 on 6 cores: reception froze for 450 s with angle decoding as
+    # -1395.20 deg from a torn frame.
+    #
+    # This is NOT a bandwidth problem, and the ID list is not the lever. At 14 wire
+    # bytes per frame the feed is 39 KB/s against ~1000 KB/s of USB FS bulk, and
+    # the host unpack loop benchmarks at 380k frames/s -- 132x headroom. Trimming
+    # MAZDA_HOST_IDS only lengthens the overflow window; it never fixes the stall
+    # that consumes it. Give the panda role cores of its own instead, and the radar
+    # shadow IDs fit with room to spare.
     ncpu = os.cpu_count() or 6
     try:
         if ncpu >= 6:
-            os.sched_setaffinity(0, {0, 1, 2, 3})
+            # The daemons keep 4 and 5 (see daemon_core below) and total ~34%, so
+            # the panda role shares that pair rather than taking a core outright:
+            # its 10 threads at ~18% combined are better served by two cores at
+            # ~57% load than by one at ~40% where they would queue behind
+            # each other.
+            os.sched_setaffinity(0, {4, 5} if role == "panda" else {0, 1, 2, 3})
     except Exception as e:
         print("could not pin main process:", e)
 
@@ -1590,8 +1705,22 @@ def pipeline(args):
     # actually applied, which only the tx thread knows. carState is handled
     # separately through pm_cs. Everything else is model-side.
     PANDA_TOPICS = {'pandaStates', 'carOutput'}
+    # ...but NOT from the shared publish loop when this process owns the panda.
+    #
+    # MEASURED 2026-08-10: in the panda role that loop runs at ~52 Hz, not the 250
+    # it is paced for -- can_thread, tx_thread and carstate_thread crowd it out.
+    # carOutput then publishes at 52.6 Hz against a 100 Hz nominal and pandaStates
+    # at 6.1 against 10, both under selfdrived's 0.8x floor, which raises
+    # commIssue/commIssueAvgFreq. Those are SOFT-DISABLE events, so lateral
+    # engaged for a median of 4.0 seconds and dropped, 145 times in one drive.
+    #
+    # carstate_thread holds 109.8 Hz in the same process, so publish them there
+    # instead. Nothing else changes: carOutput carries no populated fields here
+    # (selfdrived polls it for liveness), and pandaStates is built from
+    # health_state either way.
+    FAST_PANDA_TOPICS = PANDA_TOPICS if owns_panda else set()
     if role == "panda":
-        main_pub = [t for t in avail if t in PANDA_TOPICS]
+        main_pub = [t for t in avail if t in PANDA_TOPICS and t not in FAST_PANDA_TOPICS]
     elif role == "model":
         main_pub = [t for t in avail if t != 'carState' and t not in PANDA_TOPICS]
     else:
@@ -1603,6 +1732,10 @@ def pipeline(args):
     # either log.
     pm_cs = (messaging.PubMaster(['carState'])
              if ('carState' in avail and owns_panda) else None)
+    # carOutput + pandaStates ride carstate_thread's 110 Hz clock, not the shared
+    # publish loop -- see the note at FAST_PANDA_TOPICS.
+    _fast_list = [t for t in avail if t in FAST_PANDA_TOPICS]
+    pm_fast = messaging.PubMaster(_fast_list) if _fast_list else None
     _sub = ['selfdriveState', 'carControl', 'onroadEvents']
     if role == "model":
         # The model role does not own the panda, so nothing local decodes the bus.
@@ -1688,13 +1821,47 @@ def pipeline(args):
                  # could be read, leaving no way to tell whether the wheel actually
                  # responded. 900k rows is ~68 min at ~40 MB -- cheap next to
                  # losing the one event the trace exists to capture.
+                 #
+                 # FLUSHED INCREMENTALLY, NOT REWRITTEN. This deque now holds only
+                 # the rows not yet on disk; it is drained on every flush, so the
+                 # write cost is proportional to the last 10 s and not to the whole
+                 # session. The maxlen is a burst guard, nothing more.
+                 #
+                 # It used to be the whole session's history, rewritten from
+                 # scratch every 10 s with a %-format and a write() per row. That
+                 # is O(n) forever on a buffer that only grows, and it runs on the
+                 # main loop -- so it holds the GIL for the entire write.
+                 #
+                 # MEASURED 2026-08-11 in the model role at 293,002 rows / 18.7 MB:
+                 # modelV2 published at its nominal 19.2 Hz (p50 52.2 ms, p95
+                 # 55.1 ms) and then FROZE FOR 3.9-4.1 s, once every 10 s, six times
+                 # in sixty seconds. modelV2, livePose, longitudinalPlan and
+                 # liveCalibration all stalled together (same thread); carState,
+                 # published from the panda role, never exceeded 20.9 ms.
+                 #
+                 # Downstream that reads as twelve services not_alive -> commIssue
+                 # [NS] -> softDisable, which is why engagement died after a few
+                 # seconds and openpilot "gave up mid curve". The giveaway was that
+                 # it got worse the longer the stack ran, with nothing retuned:
+                 # early in a drive the buffer is short and the write is quick, and
+                 # it crosses the aliveness timeout only once enough rows pile up.
+                 # At the 900k maxlen the old code would have stalled ~12 s.
                  "buf": _c.deque(maxlen=int(os.environ.get("OP_LAT_TRACE_ROWS", "900000"))),
+                 # Header goes down once, when the file is created.
+                 "hdr": False,
                  # NOT /tmp. The Jetson clears it on boot, and the 2026-08-09 drive
                  # -- the one carrying the first plan_y capture -- was gone before it
                  # could be read. A trace that does not survive a reboot cannot
                  # answer a question about last night.
-                 "path": os.environ.get("OP_LAT_TRACE_PATH",
-                                        "/home/tran/drivelogs/lat_trace.csv")}
+                 # ROLE-SUFFIXED. Both roles run this same code and both were
+                 # launched with OP_LAT_TRACE=1, so with one shared default path
+                 # they interleaved rows into a single file -- and now that the
+                 # first flush truncates, they would each throw away the other's
+                 # trace on startup. An explicit OP_LAT_TRACE_PATH still wins, so
+                 # a deliberate single-file capture is still possible.
+                 "path": os.environ.get(
+                     "OP_LAT_TRACE_PATH",
+                     "/home/tran/drivelogs/lat_trace_%s.csv" % role)}
     panda_lock = threading.Lock()
     # The 0x243 stream owns the serial link. can_thread's can_recv() is a ~15.5 ms
     # round-trip and it loops with NO sleep, so it reacquires panda_lock almost
@@ -1935,6 +2102,13 @@ def pipeline(args):
                         cam_state["BIT_1"] = (d[3] >> 5) & 1
                         cam_state["ERR_BIT_1"] = d[2] & 1
                         cam_state["ERR_BIT_2"] = (d[3] >> 6) & 1
+                        # Lane bits, captured for OP_LKAS_COPY_CAM_LINES. Same bit
+                        # positions the ck validator uses. Without these the tx dict
+                        # is missing the keys create_steering_control reads under
+                        # that flag, and tx_thread dies on frame one -- see the note
+                        # where cam_bits is built.
+                        cam_state["LINE_NOT_VISIBLE"] = (d[2] >> 3) & 1
+                        cam_state["LDW"] = (d[2] >> 7) & 1
                         cam_state["seen"] += 1
                         cam_state["last_t"] = time.time()
                         # --- is 0x243 arriving whole, or are we seeing a slice?
@@ -2916,8 +3090,26 @@ def pipeline(args):
                 apply_torque = 0
                 tx_state["apply_last"] = 0
 
+            # LINE_NOT_VISIBLE/LDW BELONG HERE TOO, and their absence was a live
+            # trap. create_steering_control reads them only when _COPY_CAM_LINES is
+            # set (mazdacan.py:46), so with the flag off the lookup short-circuits
+            # and nothing notices they were never in this dict. Turn the flag on and
+            # the very first frame raises KeyError inside tx_thread.
+            #
+            # MEASURED 2026-08-11: that is exactly what happened. tx_thread died on
+            # frame one, tx_frames stayed at 0 for the whole run, and because the
+            # panda holds SAFETY_MAZDA -- which blocks the camera's own 0x243 from
+            # reaching the car -- the cluster received NO LKAS frame from any
+            # source and raised the front camera sensor fault. Armed, silent, and
+            # faulting the car is the worst of the three states, and the only
+            # symptom in the log was txgap=0/0ms.
+            #
+            # Bit positions match the ck validator above: lnv = byte2 bit3,
+            # ldw = byte2 bit7 (DBC CAM_LKAS LINE_NOT_VISIBLE / LDW).
             cam_bits = {"BIT_1": cam_state["BIT_1"], "ERR_BIT_1": cam_state["ERR_BIT_1"],
-                        "ERR_BIT_2": cam_state["ERR_BIT_2"]}
+                        "ERR_BIT_2": cam_state["ERR_BIT_2"],
+                        "LINE_NOT_VISIBLE": cam_state.get("LINE_NOT_VISIBLE", 0),
+                        "LDW": cam_state.get("LDW", 0)}
 
             # Steering-wheel angle the MODEL wants, from controlsd's clipped desired
             # curvature through the VehicleModel. Always computed (it is the useful
@@ -3689,6 +3881,41 @@ def pipeline(args):
             cs.cruiseState.speed = 25.0
             m.valid = True
             pm_cs.send('carState', m)
+
+            # carOutput at this thread's rate, pandaStates decimated to ~10 Hz.
+            # Both used to ride the shared publish loop, which in the panda role
+            # runs at ~52 Hz rather than the 250 it is paced for -- putting them
+            # under selfdrived's 0.8x floor and soft-disabling lateral every few
+            # seconds. This thread holds 110 Hz, which is what they need.
+            if pm_fast is not None:
+                _fp = cs_edge.setdefault("fast_n", 0)
+                cs_edge["fast_n"] = _fp + 1
+                try:
+                    if 'carOutput' in _fast_list:
+                        _co = messaging.new_message('carOutput')
+                        _co.valid = True
+                        pm_fast.send('carOutput', _co)
+                    # 110 Hz / 11 = 10 Hz, the nominal for pandaStates.
+                    if 'pandaStates' in _fast_list and _fp % 11 == 0:
+                        _hv = health_state["v"]
+                        _pm = messaging.new_message('pandaStates', 1)
+                        _ps = _pm.pandaStates[0]
+                        _ps.pandaType = log.PandaState.PandaType.dos
+                        if _hv is not None:
+                            _ps.uptime = int(_hv[0])
+                            _ps.ignitionLine = bool(_hv[8])
+                            _ps.ignitionCan = bool(_hv[9])
+                            _ps.controlsAllowed = bool(_hv[10])
+                            _ps.safetyModel = 'mazda'
+                            _ps.safetyParam = int(_hv[13])
+                            _ps.rxBufferOverflow = int(_hv[6])
+                            _ps.txBufferOverflow = int(_hv[5])
+                            _ps.heartbeatLost = bool(_hv[16])
+                            _ps.powerSaveEnabled = bool(_hv[15])
+                        _pm.valid = True
+                        pm_fast.send('pandaStates', _pm)
+                except Exception:
+                    pass
             nxt += period
             slp = nxt - time.time()
             time.sleep(slp) if slp > 0 else (nxt := time.time())
@@ -4535,11 +4762,33 @@ def pipeline(args):
                 if (now - lat_trace["t"]) >= 10.0:
                     lat_trace["t"] = now
                     try:
-                        with open(lat_trace["path"], "w") as _f:
-                            _f.write("t,curvature,torque_norm,applied,angle,eps_eff,v,"
-                                     "lat_active,drv_trq,op_enabled,op_state\n")
-                            for r in lat_trace["buf"]:
-                                _f.write("%.4f,%.6f,%.4f,%d,%.2f,%.1f,%.2f,%d,%.1f,%d,%s\n" % r)
+                        # Drain first, then write. Anything appended by another
+                        # thread while the write is in flight belongs to the NEXT
+                        # flush, not this one -- iterating the live deque would
+                        # race with append.
+                        _rows = []
+                        _b = lat_trace["buf"]
+                        while _b:
+                            _rows.append(_b.popleft())
+                        if _rows:
+                            # "a", not "w": each flush costs only the last ~10 s.
+                            # Build one string and write it once rather than
+                            # calling write() per row -- with the GIL held on the
+                            # main loop, the syscall count is the part that hurts.
+                            # First flush of the run truncates ("w") so a stale
+                            # file from a previous launch is replaced rather than
+                            # appended to with a header stranded in its middle.
+                            # Every flush after that appends.
+                            _new = not lat_trace["hdr"]
+                            with open(lat_trace["path"], "w" if _new else "a") as _f:
+                                if _new:
+                                    _f.write("t,curvature,torque_norm,applied,angle,"
+                                             "eps_eff,v,lat_active,drv_trq,op_enabled,"
+                                             "op_state\n")
+                                    lat_trace["hdr"] = True
+                                _f.write("".join(
+                                    "%.4f,%.6f,%.4f,%d,%.2f,%.1f,%.2f,%d,%.1f,%d,%s\n" % r
+                                    for r in _rows))
                     except Exception:
                         pass
 
@@ -4557,6 +4806,106 @@ def pipeline(args):
             # noEntry is the one that keeps openpilot from engaging at all.
             if (now - diag["t"]) >= 1.0:
                 diag["t"] = now
+                # PANDA-SIDE STATUS, published for the model role's web UI.
+                #
+                # The page is served by the MODEL role, which owns no panda -- so
+                # every panda field on it (armed, lkas_hz, applied_torque,
+                # controls_allowed, the ck counters) rendered from uninitialised
+                # local state and read as "silent" while the panda role was in
+                # fact armed and transmitting at 50 Hz. That is a display bug from
+                # the Phase 2 split: carState and pandaStates were rewired across
+                # msgq for selfdrived, but the UI's data source never was.
+                #
+                # A file rather than a new cereal message: these are diagnostic
+                # counters with no schema home (tx_frames, applied_peak, worst_ms,
+                # ck_ok/ck_bad), and inventing a capnp struct for them would be a
+                # much larger change than the bug warrants. Written atomically so
+                # the reader never sees a half-file, and stamped so a stale one
+                # from a dead panda role can be ignored rather than believed.
+                if owns_panda:
+                    try:
+                        # Snapshot the health tuple once -- can_thread rewrites
+                        # health_state["v"] from another thread, so indexing it
+                        # twice below could straddle an update.
+                        _hv6 = health_state.get("v")
+                        if _hv6 is not None and len(_hv6) < 7:
+                            _hv6 = None
+                        _ps = {
+                            "t": now, "armed": bool(armed),
+                            "tx_frames": int(tx_state.get("tx_frames", 0)),
+                            "applied_torque": int(tx_state.get("applied", 0)),
+                            "applied_peak": int(tx_state.get("applied_peak", 0)),
+                            "want_peak": int(tx_state.get("want_peak", 0)),
+                            "lkas_hz": round(float(tx_state.get("hz", 0.0)), 1),
+                            "lkas_late": int(tx_state.get("late_frames", 0)),
+                            "lkas_worst_ms": round(float(tx_state.get("worst_ms", 0.0)), 1),
+                            "tx_blocked": int(tx_state.get("blocked", 0)),
+                            "cam_seen": int(cam_state.get("seen", 0)),
+                            "ck_ok": int(cam_state.get("ck_ok", 0)),
+                            "ck_bad": int(cam_state.get("ck_bad", 0)),
+                            "ck_skip": int(cam_state.get("ck_skip", 0)),
+                            "lkas_block": bool(getattr(cs_can, "lkas_block", False)),
+                            "eps_req": int(getattr(cs_can, "eps_request", 0)),
+                            "eps_eff": int(getattr(cs_can, "eps_effective", 0)),
+                            # LINK HEALTH. mazda_filter.h says in as many words to
+                            # "WATCH rx_buffer_overflow ON THE FIRST RUN" with the
+                            # radar shadow IDs present -- and then it was never
+                            # surfaced anywhere. It is read at 10 Hz for the
+                            # pandaStates publish (index 6, see _hv above) and was
+                            # thrown away here, so when reception froze for 450 s
+                            # on 2026-08-11 the one number that would have named
+                            # the cause had to be reasoned about instead of read.
+                            #
+                            # rx_ovf climbing is the ONLY direct evidence that the
+                            # host lost the 0.71 s drain race; resync/desync are
+                            # the downstream damage (torn framing, discarded tail).
+                            # Zero rx_ovf over a full drive with the radar IDs in
+                            # MAZDA_HOST_IDS is what confirms the core pinning fixed
+                            # this, rather than merely moving the threshold.
+                            "rx_ovf": int(_hv6[6]) if _hv6 else -1,
+                            "tx_ovf": int(_hv6[5]) if _hv6 else -1,
+                            "resync_bytes": int(getattr(panda, "resync_bytes", -1)),
+                            "desync_count": int(getattr(panda, "desync_count", -1)),
+                            # The 0.71 s queue deadline, measured rather than
+                            # inferred. max_gap_ms is per-status-interval (reset on
+                            # read) so a spike shows WHEN; max_gap_ever and
+                            # over_budget accumulate for the session.
+                            "drain_gap_ms": round(float(getattr(panda, "max_gap_ms", -1.0)), 1),
+                            "drain_gap_max_ms": round(float(getattr(panda, "max_gap_ever", -1.0)), 1),
+                            "drain_over_budget": int(getattr(panda, "over_budget", -1)),
+                            # CAR STATE THE SHIM CANNOT CARRY.
+                            #
+                            # _CarStateFromMsgq maps only what stock carState has,
+                            # so in the model role these stay at their defaults and
+                            # the web page renders rpm 0 with cruise permanently
+                            # off -- while the panda role's own log shows the real
+                            # values. Reported as "engine on but the web says 0 rpm
+                            # and the cruise state keeps stalling", which is exactly
+                            # what it looks like from the page.
+                            #
+                            # engineRpm exists in the schema but this port never
+                            # populates it; acc_armed/acc_active have no schema home
+                            # at all. Both ride the status file instead, which is
+                            # already crossing this boundary for the panda fields.
+                            "rpm": int(getattr(cs_can, "rpm", 0)),
+                            "acc_armed": bool(getattr(cs_can, "acc_armed", False)),
+                            "acc_active": bool(getattr(cs_can, "acc_active", False)),
+                            "cruise_available": bool(getattr(cs_can, "cruise_available", False)),
+                            "cruise_enabled": bool(getattr(cs_can, "cruise_enabled", False)),
+                            "v_ego_kph": round(float(getattr(cs_can, "v_ego", 0.0)) * 3.6, 1),
+                        }
+                        _tmp = PANDA_STATUS_FILE + ".tmp"
+                        with open(_tmp, "w") as _f:
+                            json.dump(_ps, _f)
+                        # Window reset AFTER a successful write, so drain_gap_ms
+                        # always describes the interval this sample covers.
+                        try:
+                            panda.max_gap_ms = 0.0
+                        except Exception:
+                            pass
+                        os.replace(_tmp, PANDA_STATUS_FILE)
+                    except Exception:
+                        pass
                 g = lambda a, d=0: getattr(cs_can, a, d)
                 print("CAR %8.2fs v=%5.1fkph gear_rpm=%-5s | crz_avail=%d crz_en=%d "
                       "acc_armed=%d acc_active=%d brake=%d gas=%d "
@@ -4900,6 +5249,32 @@ def pipeline(args):
                           "moving but under 15 km/h - too slow to calibrate" if cs_can.v_ego > 0.5
                           else "stationary - calibration will NOT learn until you drive"),
                 )
+
+                # MERGE THE PANDA ROLE'S STATUS INTO THE PAGE.
+                #
+                # This UI is served by the MODEL role, which owns no panda, so
+                # every panda field above rendered from uninitialised local state:
+                # armed False, lkas_hz 0.0, applied_torque 0, the ck counters 0 --
+                # while the panda role was armed and transmitting at 50 Hz. The
+                # page reported "silent" and was believed, which is worse than
+                # showing nothing at all.
+                #
+                # Overlay only in the model role, and only from a FRESH file. A
+                # stale one means the panda role has died or was never started;
+                # showing its last values then would be the same lie in a new
+                # form, so age it out and let the fields read as absent instead.
+                if role == "model":
+                    try:
+                        with open(PANDA_STATUS_FILE) as _f:
+                            _ps = json.load(_f)
+                        if (time.time() - float(_ps.get("t", 0))) < 5.0:
+                            _ps.pop("t", None)
+                            STATE.update(_ps)
+                            STATE["panda_role"] = "live"
+                        else:
+                            STATE["panda_role"] = "stale"
+                    except Exception:
+                        STATE["panda_role"] = "absent"
                 # JPEG encoding moved to preview_thread -- doing it here put a
                 # full encode of every frame on the model's critical path.
                 STATE["_path"] = pxyz if pxyz is not None else None

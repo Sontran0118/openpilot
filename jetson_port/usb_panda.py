@@ -79,6 +79,25 @@ class UsbPanda:
         self._peak_rate = 0.0
         self._last_reset_t = 0.0
         self.rate_recoveries = 0
+        # DRAIN-GAP WATCHDOG.
+        #
+        # can_rx_q holds 2048 frames and bus 0 carries ~2870/s, so the host has
+        # 0.71 s between drains before the firmware starts dropping. Every failure
+        # this stack has had -- the 450 s freeze, the 725,938-overflow freeze, and
+        # the one at t=412 s -- is downstream of missing that deadline. Yet the gap
+        # itself was never recorded, so each time the CAUSE had to be inferred from
+        # the damage (rx_ovf, resync, a frozen carState) and twice the inference was
+        # wrong: first "the radar IDs exceed the link budget" (they do not -- 39 KB/s
+        # of ~1000 KB/s), then "the model role is stealing the panda's cores" (it was
+        # already pinned off them).
+        #
+        # These three make the deadline directly observable. If max_gap_ms stays
+        # under ~700 the host is keeping up and any overflow came from somewhere
+        # else; if it spikes past it, this names the stall instead of guessing at it.
+        self.max_gap_ms = 0.0     # worst drain gap since the last status read
+        self.max_gap_ever = 0.0   # worst for the whole session
+        self.over_budget = 0      # drains that missed the 0.71 s queue deadline
+        self._last_call_t = 0.0
 
     def control_write(self, req, p1, p2):
         return self.p._handle.controlWrite(self._Panda.REQUEST_OUT, req, p1, p2, b'')
@@ -148,6 +167,21 @@ class UsbPanda:
         # ends on a short packet or not at all, so asking for 48 KiB makes libusb
         # sit waiting for packets the firmware has no reason to send yet, and the
         # request length becomes latency. 16 KiB returns promptly and keeps up.
+        # Timed BEFORE the transfer: the question is how long the firmware's queue
+        # was left unattended, which is the interval between successive drains, not
+        # the duration of one.
+        import time as _t0
+        _call_t = _t0.monotonic()
+        if self._last_call_t:
+            _gap_ms = (_call_t - self._last_call_t) * 1000.0
+            if _gap_ms > self.max_gap_ms:
+                self.max_gap_ms = _gap_ms
+            if _gap_ms > self.max_gap_ever:
+                self.max_gap_ever = _gap_ms
+            if _gap_ms > 710.0:          # 2048 frames / ~2870 per second
+                self.over_budget += 1
+        self._last_call_t = _call_t
+
         raw = self._buf + bytes(self.p._handle.bulkRead(1, 16384))
         out = []
         i, n = 0, len(raw)

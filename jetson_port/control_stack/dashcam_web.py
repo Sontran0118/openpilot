@@ -4862,6 +4862,31 @@ def pipeline(args):
                             # Zero rx_ovf over a full drive with the radar IDs in
                             # MAZDA_HOST_IDS is what confirms the core pinning fixed
                             # this, rather than merely moving the threshold.
+                            # ALPHA LONG COUNTERS. These live in the panda role's
+                            # tx_state and were never published, so the web page
+                            # rendered the MODEL role's own empty tx_state instead
+                            # -- structurally 0 whatever the panda does.
+                            #
+                            # MEASURED 2026-08-11: that cost a wrong diagnosis. With
+                            # cruise stuck unavailable under alpha long, long_tx_frames
+                            # 0 / crz_info_tx 0 / radar_tp_tx 0 read as "we suppressed
+                            # the radar and send nothing in its place" -- the exact
+                            # shape of the armed-and-silent LKAS bug found earlier the
+                            # same day, which made it far too easy to believe. The
+                            # 10 Hz tester-present keep-alive increments radar_tp_tx or
+                            # long_tx_err on EVERY loop iteration, so a genuine 0/0
+                            # would mean the loop never ran once -- a conclusion the
+                            # data could not actually support.
+                            #
+                            # long_halted matters most: long_tx_thread returns outright
+                            # if the radar comes back while we are also writing 0x21b,
+                            # and nothing outside that thread could see it had stopped.
+                            "long_tx_frames": int(tx_state.get("long_tx_frames", 0)),
+                            "crz_info_tx": int(tx_state.get("crz_info_tx", 0)),
+                            "radar_tp_tx": int(tx_state.get("radar_tp_tx", 0)),
+                            "long_tx_err": int(tx_state.get("long_tx_err", 0)),
+                            "long_tx_last_err": str(tx_state.get("long_tx_last_err", "")),
+                            "long_halted": bool(tx_state.get("long_halted", False)),
                             "rx_ovf": int(_hv6[6]) if _hv6 else -1,
                             "tx_ovf": int(_hv6[5]) if _hv6 else -1,
                             "resync_bytes": int(getattr(panda, "resync_bytes", -1)),
@@ -4918,6 +4943,12 @@ def pipeline(args):
                       "| ang_off=%+.2f(%d) "
                       "| lc_state=%d lc_prob=%.3f desire=%d plan_y=%s "
                       "| tx_blocked=%d rx_invalid=%d "
+                      # Alpha long, on the panda's own log line. Without this the
+                      # only place these appeared was a web field fed by the model
+                      # role, which never has them -- see the note in the status
+                      # writer. "halt" is the one that must be impossible to miss:
+                      # long_tx_thread returns for good if the radar resumes.
+                      "%s"
                       "| ctrl_allowed=%d lat_active=%d op=%s applied_trq=%+5d"
                       % (now - t0, g("v_ego") * 3.6, g("rpm"),
                          int(g("cruise_available")), int(g("cruise_enabled")),
@@ -4963,6 +4994,13 @@ def pipeline(args):
                           if mstate.get("plan_y") else "-"),
                          int(health_state["v"][3]) if health_state["v"] else -1,
                          int(health_state["v"][4]) if health_state["v"] else -1,
+                         ("| long tx=%d crz=%d tp=%d err=%d%s "
+                          % (int(tx_state.get("long_tx_frames", 0)),
+                             int(tx_state.get("crz_info_tx", 0)),
+                             int(tx_state.get("radar_tp_tx", 0)),
+                             int(tx_state.get("long_tx_err", 0)),
+                             " HALTED" if tx_state.get("long_halted") else "")
+                          if alpha_long else ""),
                          int(_ca), int(cc.latActive),
                          str(ss.state), int(tx_state["applied"])),
                       flush=True)

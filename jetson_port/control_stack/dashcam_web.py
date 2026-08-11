@@ -1159,6 +1159,12 @@ def pipeline(args):
         armed = False
     mads = getattr(args, "mads", False) or os.environ.get("DASHCAM_MADS") == "1"
     alpha_long = getattr(args, "alpha_long", False) or os.environ.get("DASHCAM_ALPHA_LONG") == "1"
+    # Inject 0x21b/0x21c WITHOUT suppressing the radar. See the long note where the
+    # tx threads are started: the radar reaches the bus 14 ms after wake and will
+    # not accept a diagnostic session for 163 ms, so it can never be silenced before
+    # the car hears it. Coexisting leaves FCW/AEB/SBS alive and gives the cluster
+    # nothing to report.
+    coexist = os.environ.get("OP_ALPHA_COEXIST") == "1"
     if alpha_long and mads:
         # These used to be refused as mutually exclusive, and the reason was real:
         # MADS gated engagement inside the CRZ_CTRL rx handler, and alpha long
@@ -1825,6 +1831,13 @@ def pipeline(args):
     edge = {"prev": None, "n": 0, "last": "-"}
     diag = {"t": 0.0}   # 1 Hz CAR/EVT diagnostic tick
     radar_shadow = {}   # addr -> {n, d, t, t0}, see RADAR_IDS
+    # The radar's own 0x21b/0x21c as captured BEFORE suppression, so what we send
+    # can be diffed against what the PCM demonstrably obeys.
+    radar_pre = {}      # addr -> {n, d, t0}
+    # Follow-distance setting last seen from the radar, so the log only reports
+    # changes rather than 40 lines a second.
+    _last_ds = {"v": None}
+    from opendbc.car.mazda import longitudinal as _mazda_long
     radar_shadow_state = {"sent": 0}   # frames replayed, surfaced in the log
     ang_off = {"v": 0.0, "n": 0}   # learned steering angle offset, deg
     import collections as _c
@@ -2090,6 +2103,55 @@ def pipeline(args):
                     # last payload and a count for each so we can (a) confirm they
                     # really do go silent under suppression and (b) replay the
                     # static ones to keep the camera satisfied. See RADAR_IDS.
+                    # THE RADAR'S OWN 0x21b/0x21c, kept for comparison against ours.
+                    #
+                    # These are the two frames alpha long replaces, and the PCM obeys
+                    # the radar's copies while ignoring ours -- acc_active never
+                    # reached 1 in any run, so ACCEL_CMD was never acted on at any
+                    # speed. The obvious question is how our bytes differ from the
+                    # radar's, and there has never been a capture to answer it: the
+                    # shadow records the OTHER seven frames and not these two.
+                    #
+                    # Captured before suppression only (afterwards 0x21b on bus 0 is
+                    # our own echo). "pre" is the last radar-authored payload.
+                    if addr in (0x21B, 0x21C) and len(d) == 8 and not tx_state.get("long_tx_frames"):
+                        _p = radar_pre.setdefault(addr, {"n": 0, "d": b"", "t0": time.time()})
+                        _p["n"] += 1
+                        _p["d"] = bytes(d)
+                        # Learn the driver's follow-distance setting from the
+                        # radar's own CRZ_CTRL, so our replacement frame carries
+                        # the setting the cluster is already displaying instead of
+                        # the template's hardcoded 2. MEASURED: that single field
+                        # was the ONLY difference between the radar's 0x21c and
+                        # ours (0x13 vs 0x0b), and the front camera warning began
+                        # flickering exactly when our frame took over.
+                        if addr == 0x21C:
+                            try:
+                                # Remember the radar's byte 2 for whichever state
+                                # it is reporting, so we can reproduce the right
+                                # one instead of a static template.
+                                _mazda_long.set_observed_crz_ctrl(bytes(d))
+                                _ds = _mazda_long.distance_setting_from_frame(bytes(d))
+                                # ZERO IS NOT A SETTING. MEASURED 2026-08-11: the
+                                # radar reports DISTANCE_SETTING=0 with cruise off
+                                # and 4 once it is set, so the field tracks cruise
+                                # state, not just the driver's bars. Adopting the
+                                # last value seen would hand the cluster a 0 -- a
+                                # different wrong answer than the template's 2.
+                                # Keep the highest real value observed; that is the
+                                # driver's actual selection.
+                                if not _ds:
+                                    _ds = _last_ds["v"]
+                                elif _last_ds["v"] and _ds < _last_ds["v"]:
+                                    _ds = _last_ds["v"]
+                                if _ds and _ds != _last_ds["v"]:
+                                    _last_ds["v"] = _ds
+                                    _mazda_long.set_observed_distance_setting(_ds)
+                                    print("radar DISTANCE_SETTING observed = %s "
+                                          "(our CRZ_CTRL will match it)" % _ds,
+                                          flush=True)
+                            except Exception:
+                                pass
                     if addr in RADAR_IDS and len(d) == 8:
                         # t0 is first-seen, so the replay can derive each frame's
                         # real rate as (n-1)/(t-t0) rather than guessing. Guessing
@@ -3431,7 +3493,7 @@ def pipeline(args):
             else:
                 time.sleep(0.002)
 
-    def long_tx_thread():
+    def long_tx_thread(tx_enabled: bool = True):
         """ALPHA LONG: transmit the radar's frames in its place.
 
         WHY THIS IS A SEPARATE THREAD FROM tx_thread. The 0x243 stream is the one
@@ -3526,7 +3588,13 @@ def pipeline(args):
                 finally:
                     tx_due.clear()
 
-            if now - watch["t"] >= 2.0:
+            if coexist:
+                # The radar is deliberately alive in this mode, so its 0x21b is not
+                # evidence of a lapsed session -- it is the design. Firing the
+                # re-suppression watchdog here would try to silence a radar we chose
+                # to keep, and then halt transmit when it failed.
+                pass
+            elif now - watch["t"] >= 2.0:
                 _c = can_census[0].get(CRZ_INFO_ADDR, 0)
                 _o = tx_state.get("crz_info_tx", 0)
                 _foreign = (_c - watch["census"]) - (_o - watch["ours"])
@@ -3579,6 +3647,11 @@ def pipeline(args):
             nxt = max(nxt + period, now)
 
             cc = sm['carControl']
+            # CRZ_AVAILABLE must track the car, not our own frame. Under alpha long
+            # we generate 0x21c, so reading availability back off it is circular --
+            # acc_armed comes from PEDALS, which is the PCM's own report and what
+            # the panda gates on.
+            _mazda_long.set_cruise_available(bool(getattr(cs_can, "acc_armed", False)))
             shim.out.vEgo = float(cs_can.v_ego)
             shim.out.standstill = bool(cs_can.v_ego < 0.3)
             shim.out.gasPressed = bool(cs_can.gas_pressed)
@@ -3604,11 +3677,37 @@ def pipeline(args):
             for msg in sends:
                 if msg[0] not in LONG_ADDRS:
                     continue          # LKAS/HUD -- tx_thread owns those
+                if not tx_enabled and msg[0] != RADAR_ADDR:
+                    # Diagnostic mode: hold the session open with tester-present but
+                    # put nothing of ours on 0x21b/0x21c, so "radar silent" can be
+                    # tested apart from "we are transmitting".
+                    continue
                 tx_due.set()
                 try:
                     with panda_lock:
                         panda.can_send(msg[0], bytes(msg[1]), msg[2])
                     tx_state["long_tx_frames"] = tx_state.get("long_tx_frames", 0) + 1
+                    # ONE-SHOT DIFF against the radar's own frame, printed the first
+                    # time we send each address. The PCM obeys the radar's 0x21b/0x21c
+                    # and ignores ours (acc_active never reaches 1), so the bytes it
+                    # accepts versus the bytes it discards is the whole question --
+                    # and nothing was ever capturing the former to compare with.
+                    if msg[0] in radar_pre and not tx_state.get("diff_%x" % msg[0]):
+                        tx_state["diff_%x" % msg[0]] = True
+                        _pre = radar_pre[msg[0]]["d"]
+                        _our = bytes(msg[1])
+                        if len(_pre) == len(_our) == 8:
+                            _bits = "".join(
+                                "^" if _pre[_i] != _our[_i] else " " for _i in range(8))
+                            print("LONGDIFF 0x%03x  radar=%s  (n=%d)\n"
+                                  "         0x%03x  ours =%s\n"
+                                  "         differing bytes: %s"
+                                  % (msg[0], _pre.hex(" "), radar_pre[msg[0]]["n"],
+                                     msg[0], _our.hex(" "),
+                                     " ".join(("%02d" % _i) for _i in range(8)
+                                              if _pre[_i] != _our[_i]) or "(none)"),
+                                  flush=True)
+                            del _bits
                     if msg[0] == CRZ_INFO_ADDR:
                         # Counted separately from long_tx_frames (which also covers
                         # 0x21c and 0x764) so the watchdog above can subtract our
@@ -3696,8 +3795,18 @@ def pipeline(args):
                     with panda_lock:
                         panda.can_send(p["addr"], bytes(p["d"]), 0)
                     sent += 1
-                except Exception:
-                    pass
+                except Exception as _e:
+                    # NOT a bare swallow. MEASURED 2026-08-11: this thread printed
+                    # "replaying 7 frame(s)" and then transmitted NOTHING for whole
+                    # runs -- d_p.static21c.log and d_p.dist2.log show the replay
+                    # frozen (age 85 s and 220 s) while d_p.21cmatched.log shows it
+                    # healthy, same code and same flags. With the failure swallowed
+                    # and `sent` never surfaced, a dead shadow is indistinguishable
+                    # from a live one, and several conclusions about the dashboard
+                    # were drawn from runs where it silently was not running.
+                    radar_shadow_state["err"] = radar_shadow_state.get("err", 0) + 1
+                    radar_shadow_state["last_err"] = "%s @0x%03x" % (
+                        type(_e).__name__, p["addr"])
                 # Advance by whole periods rather than from `now`, so a late wake
                 # does not permanently shift this frame's phase. If we have fallen
                 # more than a period behind, resynchronise instead of trying to
@@ -4175,7 +4284,13 @@ def pipeline(args):
         # stream has not started yet. Needs the safety param written above, since
         # 0x764 is only in the panda's tx table under MAZDA_LONG_TX_MSGS.
         radar_suppressed = False
-        if alpha_long:
+        if alpha_long and coexist:
+            # No UDS, no session, no tester-present -- the radar is left entirely
+            # alone. Nothing suppressed means nothing for the cluster to notice,
+            # and FCW/AEB/SBS keep working throughout.
+            print("radar suppression: SKIPPED (OP_ALPHA_COEXIST) -- the radar keeps "
+                  "running and keeps FCW/AEB/SBS. We inject alongside it.")
+        elif alpha_long:
             from opendbc.car.can_definitions import CanData as _CanData
             from opendbc.car.mazda.longitudinal import CRZ_INFO_ADDR as _CRZ_INFO
             from opendbc.car.mazda.longitudinal import RADAR_ADDR as _RADAR_ADDR
@@ -4204,10 +4319,142 @@ def pipeline(args):
 
             # 0x764 + response_offset 0x8. Without 0x76C the reply is filtered
             # out in the panda before it reaches the host and this always fails.
-            uds_sniff["addrs"] = frozenset({_RADAR_ADDR + 0x8})
+            # 0x21B and 0x202 RIDE ALONG, and they are not optional.
+            #
+            # This tap IS the can_recv handed to enter_radar_standby, so whatever it
+            # filters out is invisible to the UDS layer. Limited to 0x76C, the
+            # standby ladder could see the radar's diagnostic replies and nothing
+            # else -- so its check for "did 0x21b actually stop, with the car
+            # demonstrably awake" could never observe either signal.
+            #
+            # MEASURED 2026-08-11: it reported "quiet-check INCONCLUSIVE -- no
+            # ENGINE_DATA, car asleep" while restore_radar.py, seconds earlier on
+            # the same running car, counted 260 0x21b frames in 3 s. The car was
+            # awake; the tap simply never carried the evidence.
+            #
+            # That check exists because the canonical 28 83 01 suppresses its own
+            # response (see longitudinal.py), so watching the bus is the ONLY way to
+            # tell whether standby landed. Blinding it guarantees the fallback to
+            # the programming session -- the very outcome standby exists to avoid.
+            uds_sniff["addrs"] = frozenset({_RADAR_ADDR + 0x8, _CRZ_INFO, 0x202})
             uds_sniff["q"].clear()
             uds_sniff["seen"] = 0
             uds_sniff["log"].clear()
+            # SUPPRESS AT IGNITION, NOT AFTER.
+            #
+            # Every run so far silenced the radar with the car already fully awake,
+            # because the stack is launched after the engine is started. By then the
+            # cluster, camera and PCM have completed their power-on checks and have
+            # SEEN a working radar -- so when it goes quiet they each log a
+            # communication fault against it, and the dash reports the malfunction.
+            #
+            # Striking at ignition instead means the radar is muted before those
+            # modules ever enumerate it. A module that never saw a radar has nothing
+            # to miss. This is the sequence that reportedly produced a clean dash,
+            # and it is the one thing the current flow structurally cannot do: with
+            # the car asleep it reports INCONCLUSIVE and gives up.
+            #
+            # So when the bus is dead at launch, WAIT for it rather than quitting,
+            # and run the ladder on the first sight of ENGINE_DATA. OP_SUPPRESS_WAIT
+            # bounds the wait; 0 restores the old give-up behaviour.
+            # Waits for a RISING EDGE of ignition, not merely for the bus to be
+            # alive. Two reasons:
+            #
+            #   - If the car is already awake at launch, "0x202 is present" is true
+            #     immediately and we would suppress in the same after-the-fact way
+            #     that has produced the fault every time so far. The edge is the
+            #     whole point.
+            #
+            #   - Launching against a DEAD bus is its own trap: CAN1 cannot leave
+            #     initialisation without traffic, so the core wedges and 0x202 never
+            #     arrives even after the key turns. Starting on a live bus and
+            #     riding through a key cycle avoids that entirely.
+            #
+            # So: OP_SUPPRESS_AT_IGNITION=1, start the stack with the engine
+            # RUNNING, then cycle the key. We watch 0x202 stop, then start, and fire
+            # the ladder on the upswing.
+            # WAIT FOR OUR OWN RECEPTION BEFORE JUDGING THE CAR.
+            #
+            # Every "is the car awake" test in this block reads can_census[0][0x202],
+            # which can_thread fills. On a freshly restarted panda role that census
+            # is empty for the first moment -- so a perfectly awake car reads as
+            # asleep, suppression is declared INCONCLUSIVE, and alpha long disables
+            # itself.
+            #
+            # MEASURED 2026-08-11: two consecutive runs reported "the car is asleep
+            # (0x202 0 frames over 3.0 s)" with gear_rpm=750 and the radar visibly
+            # transmitting seconds earlier. Several of today's alpha-long runs were
+            # invalidated this way, and the resulting shadow_sent=0 was then read as
+            # a shadow bug rather than a run that never started.
+            #
+            # So establish reception first, and only then decide anything.
+            _rx_deadline = time.time() + 8.0
+            while time.time() - 0 < _rx_deadline:
+                _c0 = can_census[0].get(0x202, 0)
+                time.sleep(0.3)
+                if can_census[0].get(0x202, 0) - _c0 > 5:
+                    break
+                if time.time() > _rx_deadline:
+                    print("radar suppression: no ENGINE_DATA after 8 s -- the car "
+                          "really is asleep, or reception is not up")
+                    break
+
+            _wait_edge = os.environ.get("OP_SUPPRESS_AT_IGNITION") == "1"
+            _ign_wait = float(os.environ.get("OP_SUPPRESS_WAIT", "300"))
+            if _wait_edge and _ign_wait > 0:
+                print("radar suppression: WAITING FOR AN IGNITION EDGE (up to %.0f s).\n"
+                      "    Turn the car OFF, wait for the bus to go quiet, then ON.\n"
+                      "    The radar is silenced at wake, before the cluster/camera/PCM\n"
+                      "    enumerate it -- a module that never saw a radar has nothing\n"
+                      "    to miss. Suppressing after the fact is what has been\n"
+                      "    producing the malfunction." % _ign_wait)
+                _w0 = time.time()
+                _slept = False
+                while time.time() - _w0 < _ign_wait:
+                    _c0 = can_census[0].get(0x202, 0)
+                    time.sleep(0.25)
+                    _rate = can_census[0].get(0x202, 0) - _c0
+                    if not _slept:
+                        if _rate == 0:
+                            _slept = True
+                            print("    ignition OFF detected at %.1f s -- now waiting "
+                                  "for wake" % (time.time() - _w0))
+                    elif _rate > 2:
+                        print("    IGNITION ON at %.1f s -- suppressing NOW"
+                              % (time.time() - _w0))
+                        break
+                else:
+                    print("    no ignition edge within %.0f s -- proceeding anyway "
+                          "(this will be an after-the-fact suppression)" % _ign_wait)
+
+                # LET THE RADAR FINISH ITS SELF-TEST FIRST.
+                #
+                # The fast path now reaches standby 0.48 s after ignition, and at
+                # that point the radar has NOT finished starting up: it answers
+                # 0x7f 10 22 conditionsNotCorrect for the first ~0.12 s, and the
+                # dash's radar indicators -- which normally flash through a power-on
+                # self-test -- instead go straight out. We are cutting the radar off
+                # mid-init.
+                #
+                # That is a different failure from suppressing too late. A module
+                # that watched the radar complete a healthy self-test and then go
+                # quiet may well tolerate it; one that saw the self-test aborted has
+                # every reason to log a fault. Racing to be first is only correct if
+                # enumeration is the trigger -- and 5.54 s (after the self-test) and
+                # 0.48 s (during it) BOTH produced the malfunction, which is exactly
+                # what you would expect if neither extreme is the right moment.
+                #
+                # So make the moment adjustable and aim it at "just after the lights
+                # stop flashing". Seconds, not milliseconds.
+                _sup_delay = float(os.environ.get("OP_SUPPRESS_DELAY_S", "0"))
+                if _sup_delay > 0:
+                    print("    holding %.1f s before suppressing, so the radar can "
+                          "complete its power-on self-test (watch the dash "
+                          "indicators: suppress AFTER they stop flashing)"
+                          % _sup_delay)
+                    time.sleep(_sup_delay)
+                    print("    self-test window elapsed -- suppressing now")
+
             uds_sniff["on"] = True
             _t_hs = time.time()
             try:
@@ -4254,10 +4501,41 @@ def pipeline(args):
             radar_suppressed = True
             _seen_total = 0
             _ign_total = 0
+            # HOLD THE SESSION WHILE MEASURING IT.
+            #
+            # CommunicationControl only lasts as long as tester-present keeps the
+            # diagnostic session alive -- disable_ecu says so outright: "The ECU will
+            # stay silent as long as openpilot keeps sending Tester Present." This
+            # loop used to sleep for 3 s sending nothing, which is long enough for
+            # the session to lapse and the radar to come back ON ITS OWN, mid-test.
+            #
+            # MEASURED 2026-08-11: enter_radar_standby reported "0x21b stopped" from
+            # its own 1.2 s window, and this loop then counted 23 frames over 2.5 s
+            # with the ignition alive -- and alpha long disabled itself. Both numbers
+            # were right. The radar accepted 28 83 01, went quiet, timed out and
+            # resumed, and the pair reads as a rejection when it is a lapse.
+            #
+            # long_tx_thread pumps these at 10 Hz once it starts; the gap is the
+            # window between suppression and that thread existing, which is exactly
+            # where this measurement lives.
+            def _tp_pump(_dur):
+                _t_end = time.time() + _dur
+                while time.time() < _t_end:
+                    tx_due.set()
+                    try:
+                        with panda_lock:
+                            panda.can_send(_RADAR_ADDR,
+                                           bytes([0x02, 0x3E, 0x80, 0, 0, 0, 0, 0]), 0)
+                    except Exception:
+                        pass
+                    finally:
+                        tx_due.clear()
+                    time.sleep(0.1)
+
             for _i in range(int(_SPAN / _WIN)):
                 _n0 = can_census[0].get(_CRZ_INFO, 0)
                 _i0 = can_census[0].get(0x202, 0)
-                time.sleep(_WIN)
+                _tp_pump(_WIN)
                 _n = can_census[0].get(_CRZ_INFO, 0) - _n0
                 _ign_total += can_census[0].get(0x202, 0) - _i0
                 _seen_total += _n
@@ -4281,17 +4559,78 @@ def pipeline(args):
         print(">>> ARMED: streaming 0x243 at %g Hz -> ramp %g counts/s "
               "(torque still gated by the panda)\n"
               % (lkas_hz, lkas_hz * CarControllerParams.STEER_DELTA_UP))
+        # COEXIST MODE: inject alongside a LIVE radar, without suppressing it.
+        #
+        # MEASURED 2026-08-11 at an ignition edge: the radar's first 0x21b lands
+        # 14 ms after the bus wakes, and it refuses UDS with 0x7f 10 22
+        # conditionsNotCorrect until 163 ms. We lose that race by 148 ms and no
+        # amount of polling closes it -- the car ALWAYS hears the radar first, so
+        # suppression is necessarily after the fact and the cluster always sees a
+        # working radar go quiet.
+        #
+        # So stop trying to win a race we cannot win. Two senders on one CAN id is
+        # legal: the frames arbitrate and interleave, and the PCM acts on what
+        # arrives. The panda already permits this -- 0x21b/0x21c sit in
+        # MAZDA_LONG_TX_MSGS with check_relay=false precisely so a radar that
+        # resumes does not latch relay_malfunction.
+        #
+        # NOTHING IS SUPPRESSED HERE, so FCW/AEB/SBS keep working and the cluster
+        # has nothing to complain about. That is the whole point. What is unknown
+        # is whether the PCM obeys our frames, the radar's, or neither -- which is
+        # exactly what the run will show.
+        _coexist = os.environ.get("OP_ALPHA_COEXIST") == "1"
+        if _coexist and alpha_long and not radar_suppressed:
+            print(">>> COEXIST: radar NOT suppressed. Injecting 0x21b/0x21c "
+                  "alongside it.\n    FCW/AEB/SBS remain ACTIVE. The radar is also "
+                  "writing these frames;\n    the PCM sees both.")
+            radar_suppressed = True          # let the tx threads start
         if alpha_long and radar_suppressed:
             # Started only when ARMED. Unarmed the panda is in SAFETY_SILENT and
             # would drop these anyway, but more to the point: the radar-suppression
             # UDS session is a real change to the car's state and should not happen
             # in dashcam mode.
-            threading.Thread(target=long_tx_thread, daemon=True).start()
+            # ISOLATION SWITCHES. Alpha long does three things at once -- a UDS
+            # handshake, a replay of seven shadow frames, and 0x21b/0x21c at 50 Hz --
+            # and the dash fault has only ever been observed with all three running.
+            # Timing has been ruled out (0.48 s, 5.54 s and 15.4 s all fault), so the
+            # next question is WHICH of the three the car objects to, and that cannot
+            # be answered while they are inseparable.
+            #
+            #   OP_ALPHA_NO_LONGTX=1   suppress + shadow, but send no 0x21b/0x21c
+            #   OP_ALPHA_NO_SHADOW=1   suppress + 0x21b/0x21c, but no shadow replay
+            #   both                   suppress and transmit NOTHING
+            #
+            # The last is the decisive one: if the fault still appears with the radar
+            # silent and us sending nothing at all, then the car is reacting to the
+            # radar's absence and no amount of frame-crafting will help. If it does
+            # NOT appear, the fault is in something WE send, which is fixable.
+            #
+            # Tester-present still runs in both cases -- it lives in long_tx_thread's
+            # keep-alive, and without it the session lapses and the radar returns,
+            # which would invalidate the test rather than simplify it.
+            _no_longtx = os.environ.get("OP_ALPHA_NO_LONGTX") == "1"
+            # In coexist mode the real radar is still sending all seven of these,
+            # so replaying them would put a SECOND copy of each on the bus -- two
+            # sources for frames that carry a counter, which is far more likely to
+            # upset a consumer than the frames simply being absent. The shadow
+            # exists to cover for a silenced radar; there is no silence to cover.
+            _no_shadow = coexist or os.environ.get("OP_ALPHA_NO_SHADOW") == "1"
+            if _no_longtx:
+                print("!!! OP_ALPHA_NO_LONGTX: radar suppressed, but NOTHING will be "
+                      "sent on 0x21b/0x21c. Diagnostic only -- the PCM has no "
+                      "longitudinal source, so cruise will not work.")
+            threading.Thread(target=long_tx_thread, daemon=True,
+                             kwargs={"tx_enabled": not _no_longtx}).start()
             # Put the radar's OTHER seven frames back. Started only
             # alongside alpha long, because the panda only accepts them
             # under mazda_longitudinal -- outside it they would be
             # rejected, which is the right failure direction.
-            threading.Thread(target=radar_shadow_thread, daemon=True).start()
+            if _no_shadow:
+                print("!!! OP_ALPHA_NO_SHADOW: the radar's other seven frames will "
+                      "NOT be replayed. Diagnostic only -- this is the condition "
+                      "that previously produced the front camera fault.")
+            else:
+                threading.Thread(target=radar_shadow_thread, daemon=True).start()
             print(">>> ALPHA LONG ACTIVE: 0x21b/0x21c at 50 Hz, radar tester-present "
                   "at 2 Hz.\n    FCW / AEB / SBS ARE OFF while this runs.\n")
         elif alpha_long:
@@ -4641,7 +4980,41 @@ def pipeline(args):
                                                  mstate.get("lead_a"), _lp, _vego)
                                 _mpc.set_weights(prev_accel_constraint=True, personality=0)
                                 _mpc.set_cur_state(_mpc_state["v"], _mpc_state["a"])
-                                _mpc.update(_MpcRadar(_lead), _mpc_state["v_cruise"], personality=0)
+                                # CHASE THE DRIVER'S SET SPEED, NOT A CONFIG CONSTANT.
+                                #
+                                # v_cruise was OP_V_TARGET_KPH or V_MAX_KPH -- 116 kph
+                                # by default -- so at any normal road speed the MPC is
+                                # asked to reach something far above the car and pins
+                                # at the accel cap. MEASURED 2026-08-11 in coexist
+                                # mode, the first configuration where the PCM actually
+                                # obeyed us: at 16 kph the model held ma=+1.78,
+                                # a_cmd=+1.20, "lim=accel cap" continuously, and the
+                                # car accelerated hard. Under suppression this was
+                                # invisible because the PCM ignored the frames.
+                                #
+                                # cs_can.set_speed_* comes from CRZ_EVENTS 0x21F
+                                # CRZ_SPEED. Its DBC unit is ambiguous (0.005/-0.5 over
+                                # 16 bits reads as either kph or m/s), so ACCEPT IT
+                                # ONLY IF EXACTLY ONE INTERPRETATION IS PLAUSIBLE.
+                                # Ambiguity here means commanding to the wrong scale on
+                                # a moving car.
+                                #
+                                # With no trustworthy set speed, target the CURRENT
+                                # speed: the MPC then holds rather than accelerates.
+                                # That is the safe failure -- openpilot does nothing
+                                # instead of everything.
+                                _vt = None
+                                _raw = float(getattr(cs_can, "set_speed_kph", -1.0))
+                                _cands = [v for v in (_raw, _raw * 3.6) if 20.0 <= v <= 160.0]
+                                if len(_cands) == 1:
+                                    _vt = _cands[0] / 3.6
+                                _env_t = os.environ.get("OP_V_TARGET_KPH")
+                                if _env_t:
+                                    _vt = float(_env_t) / 3.6
+                                if _vt is None:
+                                    _vt = _vego
+                                _mpc_state["v_cruise"] = _vt
+                                _mpc.update(_MpcRadar(_lead), _vt, personality=0)
                                 _a_traj = np.interp(_CTRL_T, _T_IDXS_MPC, _mpc.a_solution)
                                 _v_traj = np.interp(_CTRL_T, _T_IDXS_MPC, _mpc.v_solution)
                                 # advance the planner's own state 1 tick, exactly
@@ -4898,6 +5271,14 @@ def pipeline(args):
                             "long_tx_frames": int(tx_state.get("long_tx_frames", 0)),
                             "crz_info_tx": int(tx_state.get("crz_info_tx", 0)),
                             "radar_tp_tx": int(tx_state.get("radar_tp_tx", 0)),
+                            # SHADOW REPLAY LIVENESS. "replaying 7 frame(s)" is
+                            # printed when the plan is built, not when frames go
+                            # out, so it says nothing about whether the thread is
+                            # actually transmitting. It has been dead for entire
+                            # runs while that line sat in the log.
+                            "shadow_sent": int(radar_shadow_state.get("sent", 0)),
+                            "shadow_err": int(radar_shadow_state.get("err", 0)),
+                            "shadow_last_err": str(radar_shadow_state.get("last_err", "")),
                             "long_tx_err": int(tx_state.get("long_tx_err", 0)),
                             "long_tx_last_err": str(tx_state.get("long_tx_last_err", "")),
                             "long_halted": bool(tx_state.get("long_halted", False)),
@@ -4905,6 +5286,12 @@ def pipeline(args):
                             "tx_ovf": int(_hv6[5]) if _hv6 else -1,
                             "resync_bytes": int(getattr(panda, "resync_bytes", -1)),
                             "desync_count": int(getattr(panda, "desync_count", -1)),
+                            # Link wedges: frames exist in the silicon but never
+                            # cross USB. Distinct from every other counter here --
+                            # rx_ovf, resync and drain_gap all looked innocent while
+                            # carState sat frozen for 11 minutes.
+                            "wedge_recoveries": int(getattr(panda, "wedge_recoveries", 0)),
+                            "last_wedge": str(getattr(panda, "last_wedge", "")),
                             # The 0.71 s queue deadline, measured rather than
                             # inferred. max_gap_ms is per-status-interval (reset on
                             # read) so a spike shows WHEN; max_gap_ever and
@@ -4959,7 +5346,11 @@ def pipeline(args):
                       "| eps_req=%+5d eps_eff=%+5d lkas_block=%d hands_off=%d "
                       "| blink=%d/%d bsm=%d/%d "
                       "| cam_seen=%d cam_age=%.1fs lane_age=%.1fs ck=%d/%d/%d(l%d,d%d,a%d) "
-                      "| mpc=%d mv=%.1f/%.1f ma=%+.2f a_raw=%+.2f a_cmd=%+.2f lim=%-10s "
+                      # vtgt is the speed the MPC is actually chasing. It was a
+                      # config constant (V_MAX_KPH, 116) and nothing displayed it,
+                      # so "accelerating toward 116 kph" looked identical to normal
+                      # operation right up until the PCM started obeying us.
+                      "| mpc=%d vtgt=%.0f mv=%.1f/%.1f ma=%+.2f a_raw=%+.2f a_cmd=%+.2f lim=%-10s "
                       "| txgap=%.0f/%.0fms late=%d "
                       "| ang_off=%+.2f(%d) "
                       "| lc_state=%d lc_prob=%.3f desire=%d plan_y=%s "
@@ -5004,6 +5395,7 @@ def pipeline(args):
                          int(cam_state.get("ck_ldw", 0)),
                          int(cam_state.get("ck_ang", 0)),
                          int(_gov.get("mpc", 0)),
+                         float(_mpc_state.get("v_cruise", 0.0)) * 3.6,
                          float(_mpc_state["v"]) * 3.6, float(cs_can.v_ego) * 3.6,
                          float(_mpc_state["a"]),
                          float(_gov.get("raw", 0.0)), float(_gov.get("a", 0.0)),

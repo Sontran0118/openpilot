@@ -79,6 +79,14 @@ class UsbPanda:
         self._peak_rate = 0.0
         self._last_reset_t = 0.0
         self.rate_recoveries = 0
+        # Silicon-vs-host wedge detection. See the long note in _recv_resync: the
+        # hardware counter is the only unambiguous witness that frames exist but are
+        # not crossing the USB link.
+        self._hw_check_t = 0.0
+        self._hw_last = None
+        self._hw_n = 0
+        self.wedge_recoveries = 0
+        self.last_wedge = ""
         # DRAIN-GAP WATCHDOG.
         #
         # can_rx_q holds 2048 frames and bus 0 carries ~2870/s, so the host has
@@ -98,6 +106,39 @@ class UsbPanda:
         self.max_gap_ever = 0.0   # worst for the whole session
         self.over_budget = 0      # drains that missed the 0.71 s queue deadline
         self._last_call_t = 0.0
+
+    def _board_reset(self):
+        """0xd8 and reconnect. The only thing measured to clear a wedged link.
+
+        MEASURED 2026-08-11: with the link wedged at 4 frames/s against 2325/s of
+        silicon traffic, can_reset_communications() left it wedged; a board reset
+        restored 1425 frames/s immediately (the remainder is the host ID filter,
+        not loss).
+
+        The safety mode is deliberately NOT restored here. A reset drops the board
+        to SAFETY_SILENT, and re-arming Mazda safety is the caller's decision, not
+        a side effect of a recovery path -- the alternative is torque authority
+        quietly reappearing after a fault the caller never saw.
+        """
+        import time as _t
+        self._buf = b''
+        try:
+            self.control_write(0xd8, 0, 0)
+        except Exception:
+            pass                      # the reset tears the link down mid-transfer
+        try:
+            self.p.close()
+        except Exception:
+            pass
+        _t.sleep(4.0)
+        try:
+            self.p = self._Panda()
+        except Exception:
+            # Leave self.p as it was; the next call raises and the caller decides.
+            # Better a loud failure than a half-open handle that silently reads 0.
+            pass
+        self._hw_last = None
+        self._hw_n = 0
 
     def control_write(self, req, p1, p2):
         return self.p._handle.controlWrite(self._Panda.REQUEST_OUT, req, p1, p2, b'')
@@ -268,6 +309,48 @@ class UsbPanda:
                 except Exception:
                     pass
             self._win_t0, self._win_n = _now, 0
+
+        # SILICON-VS-HOST WEDGE DETECTOR. The authoritative test, and the only one
+        # that cannot be fooled by a quiet bus.
+        #
+        # Both watchdogs above infer a fault from the host's own arrival rate, which
+        # is ambiguous: 4 frames/s looks the same whether the car is parked or the
+        # USB link has died. CAN1's hardware counter settles it -- it counts what the
+        # SILICON received, regardless of what crossed the link.
+        #
+        # MEASURED 2026-08-11 while carState had been frozen for 11 minutes:
+        #     silicon      2327 frames/s
+        #     reaching host   4 frames/s      99.8% loss
+        #     rx overflow     0 frames/s      the firmware was NOT dropping them
+        #     can_recv calls 7436/s           we were polling correctly
+        #
+        # So the frames were not queued and discarded, they were never delivered.
+        # rx_ovf reaching 1,440,340 was the CONSEQUENCE -- the queue backs up because
+        # nothing drains it -- not the cause. And drain_over_budget stayed 0
+        # throughout, because the host met every deadline against an empty pipe.
+        #
+        # can_reset_communications() does NOT clear this; a board reset does
+        # (measured: 4/s -> 1425/s immediately after 0xd8). So escalate.
+        if _now - self._hw_check_t >= 5.0:
+            try:
+                hw = self.p.can_health(0)["total_rx_cnt"]
+            except Exception:
+                hw = None
+            if hw is not None and self._hw_last is not None:
+                hw_rate = (hw - self._hw_last) / (_now - self._hw_check_t)
+                host_rate = self._hw_n / (_now - self._hw_check_t)
+                # Only meaningful with a genuinely busy bus; a parked car is not a
+                # wedge. 10% is far below the ~60% the host filter alone explains.
+                if hw_rate > 200.0 and host_rate < 0.10 * hw_rate:
+                    if (_now - self._last_reset_t) > 15.0:
+                        self._last_reset_t = _now
+                        self.wedge_recoveries += 1
+                        self.last_wedge = "silicon %.0f/s host %.0f/s" % (hw_rate, host_rate)
+                        self._board_reset()
+            self._hw_last = hw
+            self._hw_check_t = _now
+            self._hw_n = 0
+        self._hw_n += len(out)
 
         if out:
             self._last_frame_t = _now

@@ -331,6 +331,9 @@ STATE = {
     "t": 0.0, "frames": 0, "fps": 0.0, "n_dets": 0, "n_placed": 0,
     "v_ego_kph": 0.0, "rpm": 0,
     "cruise_available": False, "cruise_enabled": False,
+    # Default so the page renders the stock cruise fields until a panda role that
+    # actually knows the mode overwrites it. See the note in the status writer.
+    "alpha_long": False,
     "brake": False, "steer_torque": 0.0, "steer_pressed": False,
     "curvature": 0.0, "path_reach": 0.0,
     # Which driving model is loaded, and whether it has an action head. "action
@@ -431,8 +434,19 @@ async function tick(){
   document.getElementById('v').textContent=s.v_ego_kph.toFixed(1)+' kph';
   document.getElementById('v').className='v '+(s.v_ego_kph>1?'ok':'');
   document.getElementById('rpm').textContent=s.rpm;
-  document.getElementById('crz').textContent=(s.cruise_enabled?'ENGAGED':(s.cruise_available?'available':'off'));
-  document.getElementById('crz').className='v '+(s.cruise_enabled?'ok':(s.cruise_available?'warn':''));
+  // UNDER ALPHA LONG, cruise_available/cruise_enabled DESCRIBE OUR OWN FRAME.
+  // They decode from 0x21c on bus 0, and once the radar is suppressed that is the
+  // frame WE generate -- so they report what we put in it, not what the driver
+  // pressed. Reported as "cruise is always off in the web while i did turn it on"
+  // with the panda log showing acc_armed=1, op=enabled, ctrl_allowed=1 at the same
+  // instant. acc_armed is the field that follows the button in this mode, so
+  // prefer it and say which one is being shown.
+  var _al = !!s.alpha_long, _armed = !!s.acc_armed, _act = !!s.acc_active;
+  var _on  = _al ? (_act || s.cruise_enabled) : s.cruise_enabled;
+  var _av  = _al ? _armed : s.cruise_available;
+  document.getElementById('crz').textContent =
+      (_on?'ENGAGED':(_av?(_al?'armed':'available'):'off')) + (_al?' (long)':'');
+  document.getElementById('crz').className='v '+(_on?'ok':(_av?'warn':''));
   document.getElementById('op').textContent=s.op_state+(s.lat_active?' / lat':'');
   document.getElementById('op').className='v '+(s.op_enabled?'ok':'');
   document.getElementById('curv').textContent=s.curvature.toFixed(5);
@@ -4915,6 +4929,13 @@ def pipeline(args):
                             "rpm": int(getattr(cs_can, "rpm", 0)),
                             "acc_armed": bool(getattr(cs_can, "acc_armed", False)),
                             "acc_active": bool(getattr(cs_can, "acc_active", False)),
+                            # The web page needs to know which mode it is rendering:
+                            # under alpha long, cruise_available/cruise_enabled decode
+                            # from the 0x21c WE generate, so they describe our own
+                            # frame rather than the driver's button. Without this flag
+                            # the page cannot tell the two cases apart and shows
+                            # "cruise off" while the car is engaged.
+                            "alpha_long": bool(alpha_long),
                             "cruise_available": bool(getattr(cs_can, "cruise_available", False)),
                             "cruise_enabled": bool(getattr(cs_can, "cruise_enabled", False)),
                             "v_ego_kph": round(float(getattr(cs_can, "v_ego", 0.0)) * 3.6, 1),
@@ -4942,6 +4963,10 @@ def pipeline(args):
                       "| txgap=%.0f/%.0fms late=%d "
                       "| ang_off=%+.2f(%d) "
                       "| lc_state=%d lc_prob=%.3f desire=%d plan_y=%s "
+                      # ACC set speed, raw and both candidate scalings, so ONE look
+                      # at the cluster settles the DBC's ambiguous unit. -1 means
+                      # 0x21F never arrived.
+                      "| setspd raw=%d a=%.1f b=%.1f "
                       "| tx_blocked=%d rx_invalid=%d "
                       # Alpha long, on the panda's own log line. Without this the
                       # only place these appeared was a web field fed by the model
@@ -4992,6 +5017,9 @@ def pipeline(args):
                          int(mstate.get("desire", 0)),
                          ("%+.2f/%+.2f/%+.2f" % mstate["plan_y"]
                           if mstate.get("plan_y") else "-"),
+                         int(getattr(cs_can, "set_speed_raw", -1)),
+                         float(getattr(cs_can, "set_speed_kph", -1.0)),
+                         float(getattr(cs_can, "set_speed_ms", -1.0)) * 3.6,
                          int(health_state["v"][3]) if health_state["v"] else -1,
                          int(health_state["v"][4]) if health_state["v"] else -1,
                          ("| long tx=%d crz=%d tp=%d err=%d%s "

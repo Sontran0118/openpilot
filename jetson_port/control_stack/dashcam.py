@@ -42,6 +42,18 @@ LOG_PATH = os.environ.get("DASHCAM_LOG", "/tmp/dashcam_%d.jsonl" % int(time.time
 # --- real CAN signal positions, verified against the car (see cruise_watch) ----
 CRZ_CTRL, CRZ_BTNS, PEDALS, STEER_TORQUE, ENGINE_DATA, WHEELS = \
     0x21c, 0x09d, 0x165, 0x240, 0x202, 0x215
+# CRZ_EVENTS carries CRZ_SPEED -- the ACC SET SPEED, the one number needed to move
+# the factory cruise setpoint in closed loop instead of open-loop press-counting.
+# It was already in MAZDA_HOST_IDS and simply never decoded.
+#
+# WHY IT MATTERS BEYOND BUTTONS: carState.cruiseState.speed is hardcoded to 25.0
+# in dashcam_web.py, and the MPC is handed V_MAX_KPH as its target. Both mean the
+# solver is permanently asked to reach a speed far above the current one, so its
+# output saturates -- MEASURED 2026-08-11, longitudinalPlan.aTarget sat at exactly
+# 1.200 (the OP_ACCEL_MAX cap) and carControl accel at 2.000, never once taking an
+# intermediate value over 819 samples. A longitudinal controller built on a
+# saturated constant would just wind the set speed to its limit and stop.
+CRZ_EVENTS = 0x21f
 STEER = 0x82   # STEER (130): STEER_ANGLE big-endian 16b @bit23, 0.05 deg, -1600 offset
 STEER_RATE = 0x241   # STEER_RATE (577): the EPS's OWN account of the LKAS command
 BLINK_INFO = 0x09a   # BLINK_INFO (154): turn signal lamps -> DesireHelper
@@ -82,6 +94,12 @@ class CarStateFromCAN:
         self.v_ego = 0.0
         self.cruise_available = False
         self.cruise_enabled = False
+        # ACC set speed off CRZ_EVENTS. -1 means "never decoded", which is
+        # distinguishable from a genuine 0 -- a controller must not treat an
+        # absent set speed as "the driver asked for zero".
+        self.set_speed_raw = -1
+        self.set_speed_kph = -1.0
+        self.set_speed_ms = -1.0
         # PEDALS-derived MRCC state -- see the PEDALS branch in update().
         self.acc_armed = False
         self.acc_active = False
@@ -129,6 +147,20 @@ class CarStateFromCAN:
         if addr == CRZ_CTRL:
             self.cruise_available = bool(bit(d, 17))
             self.cruise_enabled = bool(bit(d, 3))
+        elif addr == CRZ_EVENTS:
+            # CRZ_SPEED : 7|16@0+ (0.005, -0.5) -- big-endian, start bit 7 is the
+            # MSB of byte 0, so the value spans bytes 0..1.
+            #
+            # UNITS ARE UNVERIFIED. factor 0.005 over 16 bits tops out at ~327,
+            # which is plausible as km/h and implausible as m/s, but the DBC does
+            # not say and this port has no capture to settle it. Stored raw and in
+            # both interpretations so one drive can decide it against the number on
+            # the dash -- rather than picking one now and silently commanding to
+            # the wrong scale later.
+            self.set_speed_raw = (d[0] << 8) | d[1]
+            _v = self.set_speed_raw * 0.005 - 0.5
+            self.set_speed_kph = _v          # if the DBC unit is km/h
+            self.set_speed_ms = _v           # if it is m/s (x3.6 for km/h)
         elif addr == CRZ_BTNS:
             self.buttons = dict(set_p=bit(d, 4), set_m=bit(d, 5),
                                 res=bit(d, 2), off=bit(d, 0))

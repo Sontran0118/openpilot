@@ -69,7 +69,31 @@ class UsbPanda:
         # Stream realignments. Non-zero is not fatal, but a climbing count means
         # the host is not draining fast enough to keep up with the bus.
         self.desync_count = 0
+        # Wrong-lock detector state -- see the long note in _recv_resync.
+        # A real bus shows a small stable ID set (23 on bus 0 of this car); a
+        # wrong byte alignment shows essentially random addresses. 80 is far
+        # above any plausible real bus here and far below the hundreds a wrong
+        # lock produces, so it discriminates without tuning.
+        import time as _t_init
+        self._LOCK_WINDOW_S = 1.0
+        self._LOCK_MAX_IDS = int(__import__("os").environ.get("OP_LOCK_MAX_IDS", 80))
+        self._lock_addrs = set()
+        self._lock_frames = 0
+        self._lock_bad = 0
+        self._lock_t0 = _t_init.monotonic()
         self.resync_bytes = 0     # bytes dropped re-locking onto a frame boundary
+        # Per-packet sync marker emitted by the marked firmware. _marked latches
+        # True the first time a marked packet parses cleanly, after which the
+        # parser REQUIRES the marker -- see the note in _recv_resync.
+        self._SYNC = 0xAA
+        self._marked = False
+        # Drain loop bounds -- see the note at the bulkRead in _recv_resync.
+        # 8 x 16 KiB = 128 KiB per call, ~10000 packets, far more than the
+        # firmware's 2048-frame queue can ever hold, so the cap is a runaway
+        # guard rather than a limit reached in normal operation.
+        self._MAX_DRAIN_READS = int(__import__("os").environ.get("OP_MAX_DRAIN_READS", 8))
+        self.drain_reads = 0      # total bulk transfers issued
+        self.drain_capped = 0     # calls that hit the cap with data still waiting
         self._buf = b''           # our own tail, not the lib's overflow buffer
         self._last_frame_t = 0.0  # when a genuine frame last arrived
         self.stall_recoveries = 0
@@ -77,7 +101,12 @@ class UsbPanda:
         self._win_t0 = 0.0
         self._win_n = 0
         self._peak_rate = 0.0
-        self._last_reset_t = 0.0
+        # Two INDEPENDENT cooldowns. can_reset_communications (soft) cannot
+        # clear a wedged USB endpoint; only a 0xd8 board reset can. Sharing one
+        # timestamp let the soft path, which retries every ~15 s during any
+        # collapse, permanently suppress the board reset.
+        self._last_soft_reset_t = 0.0
+        self._last_board_reset_t = 0.0
         self.rate_recoveries = 0
         # Silicon-vs-host wedge detection. See the long note in _recv_resync: the
         # hardware counter is the only unambiguous witness that frames exist but are
@@ -87,6 +116,10 @@ class UsbPanda:
         self._hw_n = 0
         self.wedge_recoveries = 0
         self.last_wedge = ""
+        # Consecutive 5 s windows with zero silicon rx while the ignition is on.
+        # See the frozen-core branch in _recv_resync.
+        self._frozen_windows = 0
+        self._bus_err = {}
         # DRAIN-GAP WATCHDOG.
         #
         # can_rx_q holds 2048 frames and bus 0 carries ~2870/s, so the host has
@@ -106,6 +139,65 @@ class UsbPanda:
         self.max_gap_ever = 0.0   # worst for the whole session
         self.over_budget = 0      # drains that missed the 0.71 s queue deadline
         self._last_call_t = 0.0
+
+    def ep1_guard_counts(self):
+        """EP1 IN guard counters from the panda (control request 0xda).
+
+        Returns (busy_skips, nospace_skips), or None on firmware without the
+        guard. busy_skips > 0 is direct evidence of the race that used to
+        corrupt the bulk endpoint: an IN token arriving while a transfer was
+        still open, which the old code answered by rewriting DIEPTSIZ on top of
+        the transfer in flight.
+        """
+        import struct as _s
+        try:
+            b = bytes(self.control_read(0xda, 0, 0, 8))
+        except Exception:
+            return None
+        if len(b) < 8:
+            return None
+        return _s.unpack('<II', b[:8])
+
+    # struct health_t, board/health.h. Only the two ignition bytes are needed here;
+    # the full layout lives in dashcam_web.HEALTH_FMT.
+    _HEALTH_FMT = '<IIIIIIIIBBBBBHBBBHfBBHBHHB'
+
+    def _ignition_on(self) -> bool:
+        """True if the car is awake, per the panda's own ignition detect.
+
+        Used to tell a WEDGED core from a PARKED car: both look like zero traffic,
+        and resetting the board every 10 s in a car that is simply switched off
+        would be a reset loop rather than a recovery. Fails CLOSED -- if the health
+        read does not work we report False, so an unreadable board is never a
+        reason to reset it.
+        """
+        import struct as _s
+        try:
+            hh = self.control_read(0xd2, 0, 0, 64)
+            v = _s.unpack(self._HEALTH_FMT, bytes(hh)[:_s.calcsize(self._HEALTH_FMT)])
+        except Exception:
+            return False
+        # [8] ignition_line, [9] ignition_can. Either is enough.
+        return bool(v[8] or v[9])
+
+    def bus_error_state(self, bus: int = 0) -> dict:
+        """bus_off / error counters / rx delta, for the CAR line.
+
+        A frozen core reports all of these as healthy -- that is the whole point of
+        the note in _recv_resync -- so this is not a wedge detector. It is here so
+        the OTHER failure modes (a genuinely error-passive or bus-off core, which
+        DO show up here) stop being invisible, and so total_rx_cnt is on the line
+        where a frozen core can be seen by eye.
+        """
+        try:
+            h = self.p.can_health(bus)
+        except Exception:
+            return {}
+        return {"bus_off": int(h.get("bus_off", 0)),
+                "tx_err": int(h.get("transmit_error_cnt", 0)),
+                "rx_err": int(h.get("receive_error_cnt", 0)),
+                "total_rx": int(h.get("total_rx_cnt", 0)),
+                "total_fwd": int(h.get("total_fwd_cnt", 0))}
 
     def _board_reset(self):
         """0xd8 and reconnect. The only thing measured to clear a wedged link.
@@ -208,6 +300,12 @@ class UsbPanda:
         # ends on a short packet or not at all, so asking for 48 KiB makes libusb
         # sit waiting for packets the firmware has no reason to send yet, and the
         # request length becomes latency. 16 KiB returns promptly and keeps up.
+        #
+        # The drain loop below is NOT that mistake repeated. It keeps every
+        # request at 16 KiB and instead issues MORE of them, and each one still
+        # ends the moment the firmware has nothing left (the EP1 handler sends a
+        # ZLP -- see the note in board/drivers/usb.h), so a follow-up read on an
+        # empty queue costs one round trip, not the 15 s libusb timeout.
         # Timed BEFORE the transfer: the question is how long the firmware's queue
         # was left unattended, which is the interval between successive drains, not
         # the duration of one.
@@ -219,43 +317,173 @@ class UsbPanda:
                 self.max_gap_ms = _gap_ms
             if _gap_ms > self.max_gap_ever:
                 self.max_gap_ever = _gap_ms
-            if _gap_ms > 710.0:          # 2048 frames / ~2870 per second
+            # 2048 frames / ~2870 per second. This figure only became MEANINGFUL
+            # with the drain loop below: it assumes a call empties the queue, and
+            # while the drain was one fixed 16 KiB read a call could only ever
+            # retrieve ~1260 packets (~439 ms of traffic), so the real deadline
+            # was shorter than this and the check passed while frames were lost.
+            if _gap_ms > 710.0:
                 self.over_budget += 1
         self._last_call_t = _call_t
 
-        raw = self._buf + bytes(self.p._handle.bulkRead(1, 16384))
+        # DRAIN UNTIL THE QUEUE IS EMPTY, not one fixed read per call.
+        #
+        # This used to be a single 16 KiB bulkRead. 16384 bytes is only ~1260
+        # packets at ~13 bytes each, which is ~439 ms of traffic on a bus running
+        # 2870 frames/s -- and the measured worst drain gap is 428 ms. So ONE read
+        # barely covered ONE gap, and any time the firmware queue held more than
+        # 16 KiB the excess was left behind to accumulate until can_rx_q (2048
+        # frames) overflowed and the firmware dropped it.
+        #
+        # MEASURED 2026-08-13: over_budget stayed at 0 -- the host was meeting the
+        # 710 ms deadline the code checks -- while rx_ovf climbed 96,870 ->
+        # 269,432 in a single run. The deadline was computed from queue depth and
+        # never accounted for how much a single transfer can actually retrieve,
+        # so it reported success while the queue overflowed continuously.
+        #
+        # A short read (fewer bytes than asked for) means the device had nothing
+        # more to give, which is the only reliable "queue empty" signal here.
+        #
+        # BOUNDED: at most _MAX_DRAIN_READS transfers per call, so a saturated bus
+        # cannot turn one can_recv() into an unbounded stall. Hitting the cap is
+        # itself a signal the host is behind, so it is counted rather than hidden.
+        _chunks = []
+        for _k in range(self._MAX_DRAIN_READS):
+            _b = bytes(self.p._handle.bulkRead(1, 16384))
+            if not _b:
+                break
+            _chunks.append(_b)
+            if len(_b) < 16384:
+                break                      # short read -> device queue drained
+        else:
+            # Ran the cap without a short read: more was still waiting.
+            self.drain_capped += 1
+        self.drain_reads += len(_chunks)
+        raw = self._buf + b''.join(_chunks)
         out = []
         i, n = 0, len(raw)
         while i + self._HEAD <= n:
-            dlc = raw[i] >> 4
-            bus = (raw[i] >> 1) & 0x7
-            dl = self._DLC_TO_LEN[dlc]
-            if i + self._HEAD + dl > n:
-                # might just be a packet split across two USB transfers -- only
-                # keep it if the header is plausible, else it is garbage.
-                if bus <= 2:
-                    break
+            # SYNC MARKER, when the firmware emits one (CAN_SYNC_MARKER in
+            # panda_f446/board/can_comms.h).
+            #
+            # Accepting BOTH formats is deliberate: firmware and host can be
+            # updated in either order without a flag day, and a mismatch degrades
+            # to the old behaviour instead of killing reception outright.
+            #
+            # Once the marked firmware is running, `self._marked` latches and the
+            # parser REQUIRES the marker. That is what makes the re-lock
+            # deterministic: a false lock then needs marker + valid header +
+            # valid XOR at exactly the right stride, and again for the packet
+            # after it, because the next marker must also land.
+            start = i
+            if raw[i] == self._SYNC and (i + 1 + self._HEAD) <= n:
+                hdr = i + 1
+            elif self._marked:
                 i += 1
                 self.resync_bytes += 1
                 continue
-            w = raw[i + 1] | (raw[i + 2] << 8) | (raw[i + 3] << 16) | (raw[i + 4] << 24)
+            else:
+                hdr = i
+
+            if hdr + self._HEAD > n:
+                break
+
+            dlc = raw[hdr] >> 4
+            bus = (raw[hdr] >> 1) & 0x7
+            dl = self._DLC_TO_LEN[dlc]
+            if hdr + self._HEAD + dl > n:
+                # might just be a packet split across two USB transfers -- only
+                # keep it if the header is plausible, else it is garbage.
+                if bus <= 2:
+                    i = start
+                    break
+                i = start + 1
+                self.resync_bytes += 1
+                continue
+            w = (raw[hdr + 1] | (raw[hdr + 2] << 8)
+                 | (raw[hdr + 3] << 16) | (raw[hdr + 4] << 24))
             addr = w >> 3
             ok = bus <= 2 and (addr <= 0x1FFFFFFF if (w >> 2) & 1 else addr <= 0x7FF)
             if ok:
                 c = 0
-                for b in raw[i:i + self._HEAD + dl]:
+                for b in raw[hdr:hdr + self._HEAD + dl]:
                     c ^= b
                 ok = (c == 0)
             if not ok:
-                i += 1
+                # Slide from the CANDIDATE START, not past the marker: the marker
+                # byte itself may be payload that merely looked like one.
+                i = start + 1
                 self.resync_bytes += 1
                 continue
+            if hdr != start:
+                # A marked packet parsed cleanly -- latch into strict mode.
+                self._marked = True
             rejected = w & 1
             returned = (w >> 1) & 1
             tag = bus + (192 if rejected else (128 if returned else 0))
-            out.append((addr, raw[i + self._HEAD:i + self._HEAD + dl], tag))
-            i += self._HEAD + dl
+            out.append((addr, raw[hdr + self._HEAD:hdr + self._HEAD + dl], tag))
+            i = hdr + self._HEAD + dl
         self._buf = raw[i:]
+
+        # ---- WRONG-LOCK DETECTOR -------------------------------------------
+        #
+        # THE FAILURE THIS EXISTS FOR. The stream has no sync marker: packets are
+        # concatenated, and a lost byte is recovered by sliding one byte until a
+        # candidate passes bus<=2, the address range and an 8-bit XOR. Those are
+        # weak: a wrong alignment passes often enough that, on a bus this
+        # repetitive, the parser can LOCK ONTO THE WRONG OFFSET and stay there --
+        # it keeps finding "valid" packets forever, advancing by their length.
+        #
+        # That is not a stall and not a wedge, so neither existing watchdog can
+        # see it: throughput is completely normal. MEASURED 2026-08-13 on a real
+        # drive: can rx 2316/s before the failure and 2320/s after, while every
+        # decoded value was garbage (rpm 8196, brake and gas both 1) for FOUR
+        # MINUTES. Suppression stopped, lateral stopped, nothing was logged.
+        #
+        # THE DISCRIMINATOR. A real CAN bus carries a small, stable set of IDs --
+        # 23 on bus 0 of this car. A wrong lock reads the payload bytes of one
+        # packet as the header of another, so its addresses are essentially
+        # random and the DISTINCT-ADDRESS COUNT explodes. That needs no prior
+        # knowledge of which IDs are expected and self-calibrates to any bus.
+        #
+        # Cheap: a set of at most a few hundred ints per window.
+        if out:
+            for _a, _d, _tag in out:
+                self._lock_addrs.add(_a)
+            self._lock_frames += len(out)
+        _now_lk = _t0.monotonic()
+        if _now_lk - self._lock_t0 >= self._LOCK_WINDOW_S:
+            _distinct = len(self._lock_addrs)
+            # Only judge a window with enough traffic to be meaningful; a quiet
+            # bus legitimately shows few frames and few IDs.
+            if self._lock_frames >= 200 and _distinct > self._LOCK_MAX_IDS:
+                self.desync_count += 1
+                self.last_wedge = "wrong-lock: %d distinct ids in %.1fs" % (
+                    _distinct, _now_lk - self._lock_t0)
+                # Drop the carry-over and re-lock from the next transfer. This is
+                # the cheap fix and usually enough: a fresh transfer boundary is
+                # a fresh chance to lock correctly.
+                self._buf = b''
+                self._lock_bad += 1
+                print("!!! CAN WRONG-LOCK: %d distinct ids in %.1f s (%d frames) "
+                      "-- dropping buffer to re-lock [%d]"
+                      % (_distinct, _now_lk - self._lock_t0, self._lock_frames,
+                         self._lock_bad), flush=True)
+                # If re-locking does not take, the byte stream itself is broken
+                # and only a board reset clears it -- the same escalation the
+                # stall watchdog uses.
+                if self._lock_bad >= 3:
+                    print("!!! CAN WRONG-LOCK persists -- board reset", flush=True)
+                    self._lock_bad = 0
+                    try:
+                        self._board_reset()
+                    except Exception as _e:
+                        print("    reset failed:", _e, flush=True)
+            else:
+                self._lock_bad = 0
+            self._lock_addrs = set()
+            self._lock_frames = 0
+            self._lock_t0 = _now_lk
 
         # STALL WATCHDOG. Reception on this board dies silently under sustained
         # load: no exception, no BAD RECV, just an empty list forever while the
@@ -300,9 +528,25 @@ class UsbPanda:
             rate = self._win_n / (_now - self._win_t0)
             self._peak_rate = max(self._peak_rate, rate)
             collapsed = (self._peak_rate > 200.0 and rate < (0.2 * self._peak_rate))
-            if collapsed and (_now - self._last_reset_t) > 10.0:
+            # SEPARATE COOLDOWN FROM THE BOARD RESET BELOW. These two used to
+            # share self._last_reset_t, and that made the cheap recovery starve
+            # the only one that works.
+            #
+            # Walk it: this block fires when collapsed and >10 s since the last
+            # reset, and it is checked every 5 s -- so while a collapse persists
+            # it re-fires every ~15 s and stamps the shared timestamp each time.
+            # The wedge detector below requires >15 s since that same stamp, and
+            # runs AFTER this block in the same call, so it saw 0 s elapsed every
+            # single time. It could never fire while a collapse was in progress
+            # -- which is precisely when it is needed.
+            #
+            # MEASURED: across the 2026-08-13 failures the endpoint was wedged
+            # for 264 s and then 452 s with wedge_recoveries stuck at 0, while
+            # can_reset_communications (which cannot clear this fault -- only a
+            # 0xd8 can) retried harmlessly throughout.
+            if collapsed and (_now - self._last_soft_reset_t) > 10.0:
                 self.rate_recoveries += 1
-                self._last_reset_t = _now
+                self._last_soft_reset_t = _now
                 self._buf = b''
                 try:
                     self.p.can_reset_communications()
@@ -342,11 +586,59 @@ class UsbPanda:
                 # Only meaningful with a genuinely busy bus; a parked car is not a
                 # wedge. 10% is far below the ~60% the host filter alone explains.
                 if hw_rate > 200.0 and host_rate < 0.10 * hw_rate:
-                    if (_now - self._last_reset_t) > 15.0:
-                        self._last_reset_t = _now
+                    # Own cooldown -- see the note in the rate watchdog above.
+                    # 15 s is long enough that a reset gets a fair chance to
+                    # take effect before another is considered, and short
+                    # enough that a wedge costs seconds rather than minutes.
+                    if (_now - self._last_board_reset_t) > 15.0:
+                        self._last_board_reset_t = _now
                         self.wedge_recoveries += 1
                         self.last_wedge = "silicon %.0f/s host %.0f/s" % (hw_rate, host_rate)
                         self._board_reset()
+                # SECOND WEDGE CASE: THE SILICON ITSELF IS FROZEN.
+                #
+                # The check above catches a live core whose frames are not reaching
+                # the host. It cannot catch a core stuck in bxCAN INITIALISATION,
+                # because then total_rx_cnt does not advance either and hw_rate is
+                # 0 -- the `hw_rate > 200` guard skips it entirely.
+                #
+                # That is the KEY-CYCLE failure, and it is the one that has been
+                # mistaken for the alpha-long radar fault more than once. bxCAN
+                # needs 11 consecutive recessive bits to leave init; with the engine
+                # off the bus never supplies them, and turning the ignition back on
+                # does NOT retrigger init. Re-setting the safety mode cannot help a
+                # core that is already wedged -- only a device reset does.
+                #
+                # It is invisible to every health field: MEASURED 2026-08-09 over a
+                # 543 s run, CAN1 total_rx_cnt frozen at 5,263,945 with delta 0/s
+                # while the ignition was ON, and TEC=0, REC=0, bus_off=0, last_error
+                # "No error". A core in init neither receives nor error-counts, so
+                # nothing reports a problem.
+                #
+                # It is not merely a reception failure. Forwarding runs inside
+                # can_rx(), so a wedged core also stops bridging cam <-> bus 0 --
+                # and with no harness relay this panda is the ONLY path between
+                # them. The cluster then raises a front camera sensor fault that
+                # looks exactly like the radar-suppression one.
+                #
+                # Signature: ignition asserted, zero frames, for two consecutive
+                # windows (10 s). Two rather than one so a momentary gap during the
+                # crank itself does not trigger a reset.
+                elif hw_rate == 0.0 and self._ignition_on():
+                    self._frozen_windows += 1
+                    # Board-reset cooldown, not the soft one: this branch also
+                    # calls _board_reset(), so it must share the timestamp with
+                    # the wedge case above and NOT with can_reset_communications.
+                    if (self._frozen_windows >= 2
+                            and (_now - self._last_board_reset_t) > 15.0):
+                        self._last_board_reset_t = _now
+                        self._frozen_windows = 0
+                        self.wedge_recoveries += 1
+                        self.last_wedge = "core frozen in init (ignition on, 0 rx for %.0fs)" % (
+                            2 * (_now - self._hw_check_t))
+                        self._board_reset()
+                else:
+                    self._frozen_windows = 0
             self._hw_last = hw
             self._hw_check_t = _now
             self._hw_n = 0

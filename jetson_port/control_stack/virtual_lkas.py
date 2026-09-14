@@ -75,14 +75,31 @@ def compute_torque(out):
     return torque, float(lateral_err), used
 
 
+# No CAN in this harness, so there is no real speed. 20 m/s is the same stated
+# assumption integrate.py and full_chain.py make. It matters because op_stream.step()
+# only feeds the online calibrator when v_ego is not None -- call it without and rpy
+# stays (0,0,0) forever, so the input warp never gets corrected.
+V_EGO_ASSUMED = 20.0
+
+_CAM = None
+
+
 def grab_frame():
-    subprocess.run(
-        ["gst-launch-1.0", "-q", "nvarguscamerasrc", "num-buffers=1",
-         "!", "video/x-raw(memory:NVMM),width=1280,height=720",
-         "!", "nvvidconv", "!", "jpegenc", "!", "filesink", "location=/tmp/vf.jpg"],
-        capture_output=True, timeout=15)
-    import cv2
-    return cv2.imread("/tmp/vf.jpg")
+    """Persistent 1080p NV12 capture, opened on first use.
+
+    Replaces a per-frame `gst-launch nvarguscamerasrc num-buffers=1 ! ... ! jpegenc
+    ! filesink` + imread, which cost ~15s a frame (process spawn + Argus init +
+    sensor start + teardown, hence the old 15s timeout), captured at 1280x720 so
+    op_frame looked up CAPTURE_FOCAL_PX[(1280,720)] = 709 px against medmodel's 910
+    -- the road branch fed a 0.78x UPSAMPLED image -- and put a lossy JPEG
+    round-trip in front of the model on top of that."""
+    global _CAM
+    if _CAM is None:
+        # See full_chain.grab: whole-frame Argus AE underexposes the road under a
+        # bright sky. CameraAE re-aims it with a slow road-band loop.
+        from op_camera_ae import CameraAE
+        _CAM = CameraAE(auto_exposure=True)
+    return _CAM.read()
 
 
 def main():
@@ -109,7 +126,7 @@ def main():
             frame = grab_frame()
             if frame is None:
                 print("  (no frame)"); time.sleep(0.2); continue
-            out = runner.step(frame)
+            out = runner.step(frame, v_ego=V_EGO_ASSUMED)
             torque, lat, src = compute_torque(out)
         else:
             lat = 0.6 * math.sin(i * 0.5)
@@ -126,4 +143,8 @@ def main():
 
 
 if __name__ == "__main__":
-    main()
+    try:
+        main()
+    finally:
+        if _CAM is not None:
+            _CAM.close()   # the sensor stays open now, so it has to be released

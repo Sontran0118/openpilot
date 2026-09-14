@@ -92,12 +92,31 @@ Verified on the car (2026-07-25, stationary, engine running):
 
 Still open:
 
-- **Auto-exposure does not work.** openpilot's AE math is ported
-  (`op_camera.py`), but `nvarguscamerasrc` only accepts a new exposure at
-  pipeline construction, and rebuilding mid-stream kills the stream. Usable mode
-  today is `auto_exposure=False`. Needs Argus runtime properties or the Argus C++
-  API.
-- **Calibration has never been learned.** `/tmp/op_calib.json` does not exist, so
+- ~~**Auto-exposure does not work.**~~ RESOLVED 2026-07-26. The premise was wrong:
+  it was never necessary to drive exposure from Python at all. `nvarguscamerasrc`
+  has AE in the ISP; it was simply switched off, because `auto_exposure=False` set
+  `aelock=true` and pinned the sensor at 30-33ms / gain 20-22.25 — a night tuning.
+  Measured in daylight that gave mean 254.6/255 with **99.2% of the frame clipped
+  to white**. Two further details that hid it: the pin was applied by BOTH branches
+  of `_open()`, so `auto_exposure=True` was also locked; and `GAIN_MAX = 22.25` is
+  outside the sensor's advertised `1 16`, so Argus rejected it ("Invalid max gain
+  value ... using default maximum gain: 0.000000") and the comment claiming high
+  gain improved night colour was describing something that never took effect.
+
+  Fix: `auto_exposure="argus"` (now the default) hands the full envelope —
+  34us..33ms, gain 1..16, isp 1..8 — to Argus with `aelock=false`, so AE runs per
+  frame in hardware with no pipeline rebuild. Measured in the same daylight:
+  mean 102.5, p1 39, p50 73, p99 213, **0.0% clipped**, converging in 1.5s and
+  holding ±0.3 over 13s with no hunting. Verified end to end off the live
+  `/stream.mjpg`. `autolevel_strength` is now 0 in `dashcam_web.py`: it existed to
+  stretch a crushed night histogram back out, and stretching a correctly-exposed
+  frame just moves the model's input off its training distribution.
+
+  Night has NOT been re-verified since the change — the envelope reaches the same
+  33ms/high-gain corner the old pin used, so it should be at least as good, but
+  confirm before relying on it after dark.
+- **Calibration has never been learned.** `~/openpilot_jetson/calib/op_calib.json`
+  does not exist (it was `/tmp/op_calib.json` when this was written), so
   every frame so far was warped with rpy = (0,0,0). The online calibrator
   (`op_calibrate.py`, a `calibrationd` port) needs a straight drive at speed.
 - **Engagement has never been demonstrated**, on bench or car. A bench harness

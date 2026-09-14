@@ -86,7 +86,7 @@ def main():
         print("(openpilot parser import needs full pkg - showing raw slices instead)")
     except Exception:
         pass
-    from constants import ModelConstants as MC
+    sys.path.insert(0,"/home/tran/openpilot_jetson/modeld"); from constants import ModelConstants as MC
     print(f"\n=== output interpretation (first slices) ===")
     print(f"IDX_N={MC.IDX_N} plan trajectory points, FEATURE_LEN={MC.FEATURE_LEN}")
     print(f"raw out[:8] = {o[:8].round(3)}")

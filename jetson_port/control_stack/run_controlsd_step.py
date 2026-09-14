@@ -68,9 +68,10 @@ def f_liveDelay(ld):
 
 def f_liveTorqueParameters(tp):
     tp.useParams = True
-    tp.latAccelFactorFiltered = 2.5
+    # MAZDA_CX9_2021 tune (CX5_2022 substitutes to it). Was 2.5 / 0.1.
+    tp.latAccelFactorFiltered = 1.7601682915983443
     tp.latAccelOffsetFiltered = 0.0
-    tp.frictionCoefficientFiltered = 0.1
+    tp.frictionCoefficientFiltered = 0.17713792194297195
 
 def f_modelV2(md):
     md.frameId = 1

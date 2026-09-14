@@ -1,77 +1,48 @@
 #!/usr/bin/env python3
-"""Proper path -> curvature derivation, matching how openpilot's lateral planner
-gets desiredCurvature from the model path — NOT the naive 2y/x^2.
+"""Shim -> /home/tran/openpilot_jetson/curvature_lib.py
 
-openpilot fits the path y(x) and evaluates curvature from the fit near a
-lookahead distance. Curvature of a planar curve y(x):
-    k = y'' / (1 + y'^2)^1.5
-For a road-following path y' is small, so k ~= y''. We fit a low-order
-polynomial y(x) over the near path (robust to model noise) and take the 2nd
-derivative at a speed-dependent lookahead.
+This used to be a byte-identical copy of the module in openpilot_jetson, and which
+one got imported depended on sys.path ordering: every consumer here does
+`sys.path.insert(0, "/home/tran/openpilot_jetson")`, which lands ahead of the script's
+own directory, so openpilot_jetson's copy won -- but only by that accident of ordering.
+Two copies of the function that decides how hard the car steers is not something to
+leave to path order, so this file now just re-exports the live one.
+
+If you want to fork the behaviour, fork it deliberately: edit openpilot_jetson's copy,
+or replace this shim with real code and say why in a comment.
 """
-import numpy as np
+import sys
 
-# openpilot model time indices (33 pts) — path points are at these times
-T_IDXS = np.array([0.0, 0.00976, 0.0398, 0.0898, 0.159, 0.248, 0.357, 0.485,
-                   0.633, 0.801, 0.989, 1.197, 1.425, 1.673, 1.941, 2.229,
-                   2.537, 2.865, 3.213, 3.581, 3.969, 4.377, 4.805, 5.253,
-                   5.721, 6.209, 6.717, 7.245, 7.793, 8.361, 8.949, 9.557, 10.185])
+_LIVE = "/home/tran/openpilot_jetson"
+if _LIVE not in sys.path:
+    sys.path.insert(0, _LIVE)
 
+# Load from the file by absolute path rather than `from curvature_lib import *`, which
+# would re-enter THIS module and quietly resolve to itself.
+import importlib.util as _ilu
 
-def path_to_curvature(path_xyz, v_ego=20.0):
-    """Derive desired curvature from the model path.
-    path_xyz: (33,3) forward(x)/left(y)/up(z) meters.
-    v_ego: speed for choosing a sensible lookahead distance.
-    Returns curvature in 1/m (positive = left)."""
-    p = np.asarray(path_xyz, dtype=float)
-    if p.shape[0] < 6:
-        return 0.0
-    x = p[:, 0]
-    y = p[:, 1]
+_spec = _ilu.spec_from_file_location("_curvature_lib_live", _LIVE + "/curvature_lib.py")
+_mod = _ilu.module_from_spec(_spec)
+_spec.loader.exec_module(_mod)
 
-    # Need enough forward extent to fit; if the path is basically static
-    # (parked / no road), curvature is 0.
-    if x[-1] - x[0] < 1.0:
-        return 0.0
-
-    # Lookahead distance ~ speed * time, clamped to the path we actually have.
-    # openpilot uses a ~T seconds lookahead; use ~2.5s worth of distance.
-    lookahead_d = float(np.clip(v_ego * 2.5, 5.0, x[-1] * 0.9))
-
-    # Fit y as a function of x with a quadratic over the near path (up to
-    # lookahead). Quadratic -> constant 2nd derivative = curvature estimate,
-    # robust to per-point model noise. Weight nearer points more.
-    mask = x <= lookahead_d
-    if mask.sum() < 4:
-        mask = np.ones_like(x, dtype=bool)
-    xf, yf = x[mask], y[mask]
-
-    # weights: emphasize near-field (where steering acts now)
-    w = 1.0 / (1.0 + xf)
-    # y = a*x^2 + b*x + c  ; curvature (small-angle) ~ y'' = 2a
-    try:
-        coeffs = np.polyfit(xf, yf, 2, w=w)
-    except Exception:
-        return 0.0
-    a, b, c = coeffs
-    yp = b          # y'(x=0) heading
-    ypp = 2.0 * a   # y''
-    # full planar curvature (not just small-angle)
-    curv = ypp / (1.0 + yp * yp) ** 1.5
-    # sanity clamp — physical road curvature is small
-    return float(np.clip(curv, -0.2, 0.2))
-
+T_IDXS = _mod.T_IDXS
+ModelAction = _mod.ModelAction
+# The action-head branch of modeld.get_action_from_model, for models that emit
+# the command themselves ("Rebellious Hope" and later). op_stream picks between
+# this and ModelAction on whether the loaded ONNX declares an `action` slice.
+DirectAction = _mod.DirectAction
+ACTION_WIDTH = _mod.ACTION_WIDTH
+path_to_curvature = _mod.path_to_curvature
+get_curvature_from_plan = _mod.get_curvature_from_plan
+get_accel_from_plan = _mod.get_accel_from_plan
+curv_from_psis = _mod.curv_from_psis
+smooth_value = _mod.smooth_value
+MAX_CURVATURE = _mod.MAX_CURVATURE
+MIN_SPEED = _mod.MIN_SPEED
+MIN_STABLE_DELAY = _mod.MIN_STABLE_DELAY
+MIN_LAT_CONTROL_SPEED = _mod.MIN_LAT_CONTROL_SPEED
+LAT_SMOOTH_SECONDS = _mod.LAT_SMOOTH_SECONDS
+LONG_SMOOTH_SECONDS = _mod.LONG_SMOOTH_SECONDS
 
 if __name__ == "__main__":
-    # self-test with known-curvature synthetic paths
-    print("=== curvature derivation self-test ===")
-    # a circular arc of radius R has curvature 1/R. Build a path on that arc.
-    for R in (200.0, 100.0, 50.0, 1e9):
-        k_true = 1.0 / R
-        # points along arc: x forward, y = R - sqrt(R^2 - x^2) ~ x^2/(2R) for small x
-        xs = np.linspace(0, 50, 33)
-        ys = R - np.sqrt(np.maximum(R * R - xs * xs, 0.0))
-        path = np.stack([xs, ys, np.zeros_like(xs)], axis=1)
-        k_est = path_to_curvature(path, v_ego=20.0)
-        print("  R=%8.0f  true k=%.5f  est k=%.5f  err=%.1e" %
-              (R, k_true, k_est, abs(k_est - k_true)))
+    print(f"shim -> {_LIVE}/curvature_lib.py ; run that file directly for its self-test")

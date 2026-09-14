@@ -40,8 +40,12 @@ to the F446, talking to the Jetson over the **ST-Link Virtual COM Port (serial)*
 
 - `drivers/serial_comms.h` — UART transport, a faithful clone of the SPI transport framing.
   Reuses panda's transport-agnostic `comms_control_handler` / `comms_can_read` / `comms_can_write`.
-- `drivers/serial_uart_raw.h` — blocking USART2 byte I/O.
-- `stm32f446/peripherals.h` — pin map: **USART2 PA2/PA3** (VCP), **CAN1 PB8/PB9**, **CAN2 PB5/PB6** (all AF9).
+- `drivers/serial_uart_raw.h` — USART2 byte I/O. TX polled; **RX via DMA1 Stream 5 into a 4 KB
+  circular buffer**. Polled RX cannot survive the CAN load: at 1.5 Mbaud a byte lands every 6.7 µs
+  into a one-byte register with no FIFO, so any ISR longer than that drops a byte.
+- `drivers/mazda_filter.h` — `mazda_host_visible()`, the 17-ID gate on the **host feed only**.
+  The CAN acceptance filters accept everything so forwarding carries the whole bus both ways.
+- `h/peripherals.h` — pin map: **USART2 PA2/PA3** (VCP), **CAN1 PB8/PB9**, **CAN2 PB5/PB6** (all AF9).
 - `boards/nucleo.h` — `board_nucleo` definition (2 CAN, minimal).
 - `stm32f446/clock.h` — 180 MHz + PLLSAI 48 MHz (F446 dual-PLL).
 - `stm32f446/stm32f446_flash.ld` — 512 K flash / 128 K RAM.
@@ -49,6 +53,85 @@ to the F446, talking to the Jetson over the **ST-Link Virtual COM Port (serial)*
 
 **Wiring:** transceiver 1 → CAN1 (PB8 RX, PB9 TX) → car main bus; transceiver 2 → CAN2 (PB5 RX,
 PB6 TX) → car camera/LKAS bus. Link + power + flash all over the Nucleo's single ST-Link USB.
+
+### CAN topology: what crosses between the buses
+
+Physical CAN1 = logical **bus 0** (car), physical CAN2 = logical **bus 2** (camera); openpilot's
+`get_fwd_bus()` only ever pairs 0↔2. Forwarding happens in the RX ISR (`bxcan.h can_rx()` →
+`safety_fwd_hook()`), and **only in a car safety mode** — `SAFETY_SILENT`/`SAFETY_NOOUTPUT` set
+`disable_forwarding`, so in dashcam mode nothing crosses in either direction.
+
+| frame | direction | what happens |
+|---|---|---|
+| `0x243` CAM_LKAS | cam → car | **blocked** — openpilot's injected steering frame replaces it |
+| `0x440` CAM_LANEINFO | cam → car | **forwarded** (port deviation, see below) |
+| every other camera frame | cam → car | **forwarded** — all 11 `CAM_*` IDs cross |
+| everything | car → cam | **forwarded** — the whole main bus, radar included |
+
+The acceptance filters accept everything, on both buses. They used to hold the 17-ID Mazda
+whitelist, but the filter sits upstream of `can_rx()` — which is where forwarding happens — so it
+was deleting 9 of the camera's 11 IDs cam→car and ~726 of the car's IDs car→cam, radar included.
+That is what raises the front-camera fault. The whitelist now lives in software
+(`mazda_filter.h`), applied at the `can_rx_q` push and the tx echo, so it trims the **host feed**
+only. Measured on the car: `fwd` 2359/s car→cam and 226/s cam→car, host feed unchanged at ~800/s.
+
+### Host link: why RX is DMA, and the byte-commit race
+
+Forwarding the whole bus raises bus-0 RX from 776 to ~2325 frames/s, which broke the serial VCP
+in two separate ways. Both are fixed; both are easy to reintroduce, so they are written down here.
+
+1. **Polled RX cannot keep up.** USART2 has a one-byte receive register and no FIFO. At 1.5 Mbaud
+   a byte lands every 6.67 µs, so any interrupt longer than that loses one. Control-transfer
+   reliability fell 100% → 62% purely from the extra CAN ISR load. Fixed by moving RX to
+   DMA1 Stream 5 circular (`serial_uart_raw.h`).
+2. **NDTR announces a byte before it reaches SRAM.** The DMA cursor decrements when the write is
+   *issued*, not when it lands, so a byte the cursor already claims can read back as the ring's
+   previous contents. Caught by re-reading the same ring address: `0x00` first, `0x07` a moment
+   later, the frame's own checksum confirming `0x07`. It corrupted ~40% of headers — one byte,
+   mid-frame, no timeout, no overrun. Fixed by reading each byte twice with a fixed spin between
+   and taking the second value; `rx_late` in the 0xd9 counters records every catch.
+
+A third one was self-inflicted: the old error paths called `uart_flush_rx()`, which is right for a
+lossy polled register and wrong for a lossless ring — it discarded good headers sitting behind the
+bad one and turned one desync into a cascade. Resync is now a one-byte rewind, and a rejected
+header is **silent** (a NACK for a header the host never sent gets read as the ack of a later
+transaction). Read `0xd9` for `txn_ok / hdr_resync / hdr_timeout / mosi_* / overrun / rx_late`.
+
+Measured on the car, engine running, forwarding active, 15 s in SAFETY_MAZDA:
+
+| | |
+|---|---|
+| control transfers | **519/519 (100%)** — was 62-75% |
+| bus 0 | rx 2325/s, fwd→cam 2325/s, rx_lost 0, err 0, bus_off 0 |
+| bus 2 | rx 240/s, fwd→car 224/s, rx_lost 0, err 0, bus_off 0 |
+| camera IDs crossing | all 11 `CAM_*` |
+| car IDs to host | exactly the 16 gated IDs present on bus 0, no garbage |
+| 0x243 inject @ 100 Hz | 1000 sent, **1000 tx-complete echoes**, 0 rejected, 0 lost |
+
+`SerialPanda.can_recv()` now verifies each packet's own XOR checksum. Without it the resync path
+invents plausible-looking frames out of packet data — that is where IDs like `0x1fe823f4` in
+earlier captures came from, and `dashcam_web.py` uses this same parser.
+
+`0x440` is forwarded by setting `.disable_static_blocking` on the `MAZDA_LKAS_HUD` entry of
+`MAZDA_TX_MSGS`, behind `#ifdef PANDA_NUCLEO` in `opendbc/safety/modes/mazda.h`. Stock openpilot
+blocks it because its Mazda CarController generates its own `0x440` at 2 Hz
+(`mazdacan.create_alert_command`); this port does not, so without the deviation the car's LKAS
+system receives **no lane state at all** and ignores the injected steering. `.check_relay` stays
+`true`, so a `0x440` or `0x243` arriving on **bus 0** still latches `relay_malfunction` — the
+protection that catches a camera which was never electrically cut off the main bus.
+
+Because this is compiled into the firmware, **changing it requires a rebuild and reflash.**
+Prove it without hardware first:
+
+```bash
+python3 control_stack/lane_fwd_test.py     # 27/27, builds libsafety stock vs -DPANDA_NUCLEO
+```
+
+**Harness requirement:** the forward camera must be *inline* — its CAN cut from the main bus and
+run only to CAN2. The Nucleo has no intercept relay (`harness_init` forces `HARNESS_STATUS_NC`),
+so this must be done in wire. If the camera stays on the main bus, its own `0x243` reaches bus 0,
+`relay_malfunction` latches, and **all tx and all forwarding stop permanently** until the safety
+mode is re-set.
 
 ## `pandad_serial/` — Jetson side
 
@@ -76,9 +159,13 @@ git clone https://github.com/commaai/opendbc.git opendbc_src && \
 cp -r panda_base panda_f446
 cd panda_f446
 cp -r  <this>/panda_f446_firmware/stm32f446        board/
-cp     <this>/panda_f446_firmware/drivers/serial_*.h  board/drivers/
+cp     <this>/panda_f446_firmware/drivers/serial_*.h     board/drivers/
+cp     <this>/panda_f446_firmware/drivers/mazda_filter.h board/drivers/
 cp     <this>/panda_f446_firmware/boards/nucleo.h     board/boards/
 git apply <this>/panda_base_patches/panda_base_3dc21386.patch
+
+# opendbc-side port patch (compiled INTO the firmware -- see CAN topology below)
+(cd ../opendbc_src && git apply <this>/opendbc_patches/opendbc_8ddffb37_mazda_lane_fwd.patch)
 
 # build + flash
 scons -j2 board/obj/bootstub.panda_f446.bin board/obj/panda_f446.bin.signed
@@ -97,8 +184,8 @@ The board silkscreens **Arduino** names, not port names:
 |--------|------|-------------|
 | CAN1 RX | PB8 | **D15** (SCL) |
 | CAN1 TX | PB9 | **D14** (SDA) |
-| CAN2 RX | PB6 | **D10** |
-| CAN2 TX | PB5 | **D4** |
+| CAN2 RX | PB5 | **D4** |
+| CAN2 TX | PB6 | **D10** |
 | 3.3V / GND / VIN | — | **CN6** (left header) |
 
 Transceivers: SN65HVD230 (3.3V native). **Remove the 120Ω termination jumper on the car side** —

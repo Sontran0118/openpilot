@@ -116,64 +116,52 @@ bool llcan_init(CAN_TypeDef *CANx) {
 
   if(ret){
 #ifdef MAZDA_FILTER
-    // ---- Hardware acceptance filter: only the IDs opendbc's Mazda port uses ----
-    // The CX-5 bus carries ~743 distinct IDs at ~2-3k frames/s, which saturates
-    // the 1.5 Mbaud serial link and overflows can_rx_q (observed 1.29M drops).
-    // Filtering in hardware cuts that to the 17 messages carstate.py reads.
+    // ---- Hardware acceptance filter: ACCEPT EVERYTHING, both buses ----
     //
-    // 16-bit LIST mode: each 32-bit register holds TWO 11-bit IDs at bits 15:5.
-    // 5 banks x 4 IDs = 20 slots; we use 17 (pad with a repeat of the first).
-    static const uint16_t mazda_ids[20] = {
-      0x078U, // BRAKE
-      0x082U, // STEER
-      0x09AU, // BLINK_INFO
-      0x09DU, // CRZ_BTNS
-      0x165U, // PEDALS
-      0x202U, // ENGINE_DATA
-      0x215U, // WHEEL_SPEEDS
-      0x21CU, // CRZ_CTRL
-      0x21FU, // CRZ_EVENTS
-      0x228U, // GEAR
-      0x240U, // STEER_TORQUE
-      0x241U, // STEER_RATE
-      0x243U, // CAM_LKAS
-      0x340U, // SEATBELT
-      0x43EU, // DOORS
-      0x440U, // CAM_LANEINFO
-      0x477U, // BSM
-      0x078U, 0x078U, 0x078U  // padding (harmless duplicates)
-    };
-
-    // MASTER/SLAVE FIX (F446): CAN1+CAN2 SHARE one filter block; CAN2 (slave) has
-    // NO filter regs of its own -- ALL filter access must go through CAN1, and the
-    // CAN2SB field in CAN1->FMR splits the banks. The old code wrote CANx->..., so
-    // for CAN2 the filter never activated -> CAN2 accepted no frames (FORM/no-rx).
-    // Fix: configure through CAN1. CAN2SB=14 -> banks 0..4 = CAN1, banks 14..18 = CAN2.
-    // We write the SAME 17-ID Mazda list into both bank ranges so either bus filters
-    // identically. Whichever CANx we're initing, the shared config is (re)applied.
-    const uint8_t base = (CANx == CAN1) ? 0U : 14U;   // this bus's filter bank range
+    // This used to be a 17-ID Mazda whitelist, written into both bank ranges, to
+    // stop the ~743-ID / ~2-3k frames-per-second main bus from saturating the
+    // 1.5 Mbaud serial link to the Jetson (observed 1.29M can_rx_q drops).
+    //
+    // That is the wrong layer. The acceptance filter sits UPSTREAM of can_rx(),
+    // and can_rx() is where safety_fwd_hook() forwards cam<->car -- so a frame
+    // dropped here is dropped from the FORWARD path too, not just the host feed.
+    // The whitelist was therefore deleting, in silicon:
+    //   cam -> car : 9 of the camera's 11 IDs (everything but 0x243 and 0x440 --
+    //                CAM_LANETRACK, CAM_DISTANCE, CAM_PEDESTRIAN, CAM_TRAFFIC_SIGNS,
+    //                CAM_SETTINGS, ...), which raises the front-camera fault.
+    //   car -> cam : ~726 of the car's IDs, including every RADAR_* frame. A
+    //                forward camera that used to see the whole main bus saw 17
+    //                messages and no radar at all.
+    // Stock panda forwards the entire bus in both directions; so do we now.
+    //
+    // The host link still cannot take the raw bus, so that trim moved into
+    // software: mazda_host_visible() in drivers/mazda_filter.h, applied at the
+    // can_rx_q push (and the tx echo) in drivers/bxcan.h. Same 17 IDs reach the
+    // Jetson as before; the car and the camera now get everything.
+    //
+    // MASTER/SLAVE (F446): CAN1+CAN2 SHARE one filter block; CAN2 (slave) has NO
+    // filter registers of its own -- ALL filter access must go through CAN1, and
+    // the CAN2SB field in CAN1->FMR splits the banks. Writing CANx->sFilterRegister
+    // for CAN2 silently does nothing, which is what once left CAN2 accepting no
+    // frames at all. CAN2SB=14 -> bank 0 belongs to CAN1, bank 14 to CAN2.
+    //
+    // One 32-bit MASK-mode bank per bus, id=0 mask=0 -> matches every frame, both
+    // standard and extended, data and remote.
+    const uint8_t bank = (CANx == CAN1) ? 0U : 14U;
+    const uint32_t bankbit = 1UL << bank;
 
     // filter config lives in the master (CAN1). enter filter-init on the master.
     register_set_bits(&(CAN1->FMR), CAN_FMR_FINIT);
     register_set(&(CAN1->FMR), (14UL << CAN_FMR_CAN2SB_Pos) | CAN_FMR_FINIT,
                  CAN_FMR_CAN2SB | CAN_FMR_FINIT);      // CAN2 start bank = 14
 
-    // 16-bit scale (FS1R clear) + LIST mode (FM1R set) for this bus's 5 banks
-    const uint32_t bankmask = 0x1FUL << base;
-    CAN1->FS1R &= ~bankmask;
-    CAN1->FM1R |= bankmask;
-
-    for (uint8_t i = 0U; i < 5U; i++) {
-      const uint8_t bank = base + i;
-      const uint16_t a = mazda_ids[(i * 4U) + 0U];
-      const uint16_t b = mazda_ids[(i * 4U) + 1U];
-      const uint16_t c = mazda_ids[(i * 4U) + 2U];
-      const uint16_t d = mazda_ids[(i * 4U) + 3U];
-      // STID occupies bits 15:5 of each 16-bit half
-      CAN1->sFilterRegister[bank].FR1 = ((uint32_t)(b << 5) << 16) | (uint32_t)(a << 5);
-      CAN1->sFilterRegister[bank].FR2 = ((uint32_t)(d << 5) << 16) | (uint32_t)(c << 5);
-    }
-    CAN1->FA1R |= bankmask;                            // activate this bus's banks
+    CAN1->FA1R &= ~(0x1FUL << bank);                   // drop this bus's old banks
+    CAN1->FS1R |= bankbit;                             // 32-bit scale
+    CAN1->FM1R &= ~bankbit;                            // mask mode (not ID list)
+    CAN1->FFA1R &= ~bankbit;                           // -> RX FIFO0, the one can_rx() reads
+    CAN1->sFilterRegister[bank].FR1 = 0U;              // id   = 0
+    CAN1->sFilterRegister[bank].FR2 = 0U;              // mask = 0 -> don't care
+    CAN1->FA1R |= bankbit;                             // activate
     register_clear_bits(&(CAN1->FMR), CAN_FMR_FINIT);  // leave filter-init on master
 #else
     // no mask

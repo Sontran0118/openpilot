@@ -3,8 +3,21 @@ sys.path.insert(0, "/home/tran/openpilot_jetson")
 from op_stream import SupercomboRunner
 
 r = SupercomboRunner()
+
+# /tmp/vf.jpg was written by the per-frame `jpegenc ! filesink` grab that every
+# harness here used to do; nothing writes it now, so fall back to a live capture.
 f = cv2.imread("/tmp/vf.jpg")
-out = r.step(f)
+if f is None:
+    from op_camera_ae import CameraAE
+    _cam = CameraAE(auto_exposure=True)
+    f = _cam.read()
+    _cam.close()
+
+# v_ego is required for out["action"] to be populated at all -- desiredCurvature is
+# psi/(v*t), so step() returns None for it rather than inventing a speed. This script
+# exists to ask whether the runner exposes an action field; without a speed the answer
+# looks like "no".
+out = r.step(f, v_ego=20.0)
 
 print("=== step() output keys ===")
 for k, v in out.items():

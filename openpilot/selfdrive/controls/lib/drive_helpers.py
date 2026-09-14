@@ -10,7 +10,54 @@ MAX_CURVATURE = 0.2
 MAX_VEL_ERR = 5.0  # m/s
 MIN_STABLE_DELAY = 0.3
 
-# EU guidelines
+# EU guidelines.
+#
+# The note that used to sit here said these were NOT binding because
+# LatControlTorque saturates below 3.0 anyway. That was measured against a
+# STEER_MAX of 800-1000 and it conflated the two constants. Re-measured
+# 2026-07-30 over a 14.5k-record drive:
+#
+#   MAX_LATERAL_JERK   caps the curvature RATE at 5.0/v^2. Observed p95 decay
+#                      rate 0.0415 1/m/s against a 0.0481 limit at the median
+#                      10.2 m/s -- 86% utilised. THIS ONE BINDS. It is the
+#                      reason turn-in and recovery both felt slow, and the
+#                      torque rate limiter was only at 75% of its own ceiling
+#                      at the same moments, so it was not the constraint.
+#
+#   MAX_LATERAL_ACCEL  caps curvature at 3.0/v^2. Observed 0.053 at 6.6 m/s
+#                      against a 0.0698 limit -- 76%. Near, not binding. Its
+#                      real cost is the floor it puts under turn radius:
+#                      24 m at 19 mph, which is why ACC's ~19 mph minimum made
+#                      tight turns impossible regardless of torque (see MADS).
+#
+# RESTORED to 5.0 (2026-07-30, same day it was doubled).
+#
+# The 86% figure above does not reproduce. Re-measured on the 2026-07-30 drive
+# (10.7k lat_active records, 77 kph max) as |d(curvature)/dt| against the
+# 10.0/v^2 limit, split by speed so a single median cannot hide a low-speed
+# problem:
+#
+#     band kph    recs     p50    p90    p99   %at 10.0 / %at 5.0
+#     10-20        400      5%    24%    74%     0.0%  /  3.8%
+#     20-30        446      5%    19%    54%     0.0%  /  1.6%
+#     30-45       2499      4%    15%    39%     0.1%  /  0.5%
+#     45-60       4154      5%    16%    40%     0.1%  /  0.6%
+#     60-90       3174      7%    24%    45%     0.0%  /  0.8%
+#
+# The limit is not close to binding anywhere -- typical use is 4-7% of it, and
+# even the stock 5.0 would clip under 1% of samples outside the 10-20 kph band.
+# So doubling it bought no turn-in and cost the only guard against the model
+# commanding an abrupt curvature change.
+#
+# The earlier measurement compared a p95 decay RATE against the limit at the
+# median speed, which mixes two different samples: the fastest curvature changes
+# do not happen at the median speed, and the limit scales as 1/v^2. Comparing a
+# p95 of one distribution to a limit computed from the median of another is what
+# produced 86%.
+#
+# What actually made turn-in feel slow was loop phase, not this cap: the rack
+# takes 200 ms to apply torque and steerActuatorDelay claimed 100 ms (see
+# opendbc/car/mazda/interface.py).
 MAX_LATERAL_JERK = 5.0  # m/s^3
 MAX_LATERAL_ACCEL_NO_ROLL = 3.0  # m/s^2
 

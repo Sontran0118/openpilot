@@ -47,14 +47,27 @@ time.sleep(0.5)
 V = 20.0
 frame_id = 0
 
-def grab():
-    import subprocess, cv2
-    subprocess.run(["gst-launch-1.0","-q","nvarguscamerasrc","num-buffers=1","!",
-        "video/x-raw(memory:NVMM),width=1280,height=720","!","nvvidconv","!","jpegenc","!",
-        "filesink","location=/tmp/vf.jpg"], capture_output=True, timeout=15)
-    return cv2.imread("/tmp/vf.jpg")
+_CAM = None
 
-def publish_all(out, curv):
+
+def grab():
+    """Persistent 1080p NV12 capture (see supercombo_publisher.grab_frame for why).
+
+    The old per-frame `gst-launch ... num-buffers=1 ! jpegenc ! filesink` + imread
+    cost ~15s a frame, captured at 720p (focal 709 vs medmodel's 910, i.e. the road
+    branch upsampled 0.78x), and put a lossy JPEG round-trip in front of the model."""
+    global _CAM
+    if _CAM is None:
+        # Road-metered AE, not op_camera.Camera: Argus meters the whole frame, so a
+        # bright sky drags the road down (measured sky p50 184 / road p50 69 in one
+        # frame whose overall mean looked fine at 101). CameraAE leaves Argus's fast
+        # loop alone and re-aims it with a slow exposurecompensation loop over the
+        # road band only.
+        from op_camera_ae import CameraAE
+        _CAM = CameraAE(auto_exposure=True)
+    return _CAM.read()
+
+def publish_all(out, curv, act=None):
     global frame_id
     def send(name, fn):
         if name == "onroadEvents":
@@ -70,7 +83,8 @@ def publish_all(out, curv):
     def lp(x):
         x.steerRatio=15.5; x.stiffnessFactor=1.0; x.angleOffsetDeg=0.0; x.roll=0.0; x.valid=True
     def tp(x):
-        x.useParams=True; x.latAccelFactorFiltered=2.5; x.latAccelOffsetFiltered=0.0; x.frictionCoefficientFiltered=0.1
+        # MAZDA_CX9_2021 tune (CX5_2022 substitutes to it). Was 2.5 / 0.1.
+        x.useParams=True; x.latAccelFactorFiltered=1.7601682915983443; x.latAccelOffsetFiltered=0.0; x.frictionCoefficientFiltered=0.17713792194297195
     def ss(x):
         x.enabled=True; x.active=True; x.state=log.SelfdriveState.OpenpilotState.enabled
     def lc(x):
@@ -84,7 +98,15 @@ def publish_all(out, curv):
             md.position.y=[float(path[i][1]) for i in range(33)]
             md.position.z=[float(path[i][2]) for i in range(33)]
             md.position.t=[float(t) for t in T_IDXS]
-        try: md.action.desiredCurvature=float(curv)
+        try:
+            md.action.desiredCurvature=float(curv)
+            # The other two fields modeld fills on this message. On the current
+            # weights they are the model's own action head, not a re-derivation
+            # from the plan; publishing them keeps modelV2 here meaning what it
+            # means on a comma three even though this port steers only.
+            if act is not None:
+                md.action.desiredAcceleration=float(act["desiredAcceleration"])
+                md.action.shouldStop=bool(act["shouldStop"])
         except Exception: pass
 
     send('carState', cs); send('liveParameters', lp); send('liveTorqueParameters', tp)
@@ -101,17 +123,26 @@ for i in range(n):
     else:
         f = grab()
         if f is None: print("no frame"); continue
-        out = runner.step(f)
+        # v_ego is required for the stock action (desiredCurvature = psi/(v*t)); this
+        # harness has no CAN, so V is its stated constant-speed assumption.
+        out = runner.step(f, v_ego=V)
 
-    curv = path_to_curvature(out.get("path_xyz"), V)
+    # STOCK when we have a real action; legacy fit only for --synthetic, which fakes
+    # path_xyz alone and has neither an action head nor plan columns.
+    act = out.get("action")
+    curv = (act["desiredCurvature"] if act is not None
+            else path_to_curvature(out.get("path_xyz"), V))
 
     for _ in range(4):
-        publish_all(out, curv)
+        publish_all(out, curv, act)
         time.sleep(0.03)
         controls.sm.update(10)
 
     CC, lac_log = controls.state_control()
     px_end = float(out["path_xyz"][-1][0])
     print("%-6d %-12.2f %-12.5f %.4f" % (i, px_end, curv, CC.actuators.torque))
+
+if _CAM is not None:
+    _CAM.close()          # the sensor stays open now, so it has to be released
 
 print("\n=== FULL LIVE CHAIN: camera -> supercombo -> curvature -> controlsd -> torque ===")

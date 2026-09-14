@@ -5,9 +5,22 @@ Runs steering commands through the REAL C safety code that executes on the
 panda, priming the torque state machine exactly like opendbc's own test suite,
 so it shows BOTH good commands being ALLOWED and bad ones being BLOCKED.
 
-Mazda limits (from opendbc/safety/tests/test_mazda.py):
-  MAX_TORQUE 800 | MAX_RATE_UP 10 | MAX_RATE_DOWN 25
-  MAX_RT_DELTA 300 | DRIVER_TORQUE_ALLOWANCE 15
+Mazda limits, taken from THE FIRMWARE (opendbc/safety/modes/mazda.h), because
+that is what this test loads and probes:
+  MAX_TORQUE 2047 | MAX_RATE_UP 80 | MAX_RATE_DOWN 50
+  MAX_RT_DELTA 2047 (deliberately == max_torque, so it never binds)
+  DRIVER_TORQUE_ALLOWANCE 15
+
+These were previously copied from opendbc's upstream test file (800/10/25/300)
+and had gone stale as this port raised them -- and the staleness was invisible
+because libsafety.so is a CHECKED-IN BINARY that nothing here rebuilds. The test
+was passing against a build of mazda.h old enough to still have max_rate_up=10.
+Rebuild before trusting a run:
+  cd ~/opendbc_src/opendbc/safety/tests/libsafety && \
+    gcc -shared -fPIC -Wall -Wextra -Werror -nostdlib -fno-builtin -std=gnu11 \
+        -Wfatal-errors -Wno-pointer-to-int-cast -DCANFD \
+        -I ~/opendbc_src -I ~/opendbc_src/opendbc/safety/board \
+        -o libsafety.so safety.c
 
 Nothing is transmitted. Run:  cd ~/opendbc_src && python3 /tmp/override_test2.py
 """
@@ -20,9 +33,9 @@ from opendbc.safety.tests.common import CANPackerPanda
 
 SafetyModel = CarParams.SafetyModel
 
-MAX_TORQUE = 800
-MAX_RATE_UP = 10
-MAX_RATE_DOWN = 25
+MAX_TORQUE = 2047
+MAX_RATE_UP = 80
+MAX_RATE_DOWN = 50
 DRIVER_TORQUE_ALLOWANCE = 15
 
 safety = libsafety_py.libsafety
@@ -72,7 +85,8 @@ def reset(controls=True):
 def main():
     safety.set_safety_hooks(SafetyModel.mazda, 0)
     print("SAFETY REGRESSION — fork safety_mazda (no transmit)")
-    print("limits: torque<=800, rate_up<=10, rate_down<=25, driver_allow=15\n")
+    print("limits: torque<=%d, rate_up<=%d, rate_down<=%d, driver_allow=%d\n"
+          % (MAX_TORQUE, MAX_RATE_UP, MAX_RATE_DOWN, DRIVER_TORQUE_ALLOWANCE))
 
     # 1. Disengaged: any nonzero steer BLOCKED, zero allowed
     print("=== 1. Controls disengaged ===")
@@ -81,26 +95,26 @@ def main():
     reset(controls=False)
     check("100 torque while off", tx(100), False)
     reset(controls=False)
-    check("max torque while off", tx(800), False)
+    check("max torque while off", tx(MAX_TORQUE), False)
 
     # 2. Engaged, within rate limit -> ALLOWED
     print("\n=== 2. Engaged, good commands (within rate) ===")
-    reset(); check("step 0 -> +10 (=rate_up)", tx(10), True)
+    reset(); check("step 0 -> +%d (=rate_up)" % MAX_RATE_UP, tx(MAX_RATE_UP), True)
     reset(); check("step 0 -> +5",  tx(5),  True)
     reset(); prev(100); check("step 100 -> 105", tx(105), True)
-    reset(); prev(100); check("step 100 -> 90 (down<=25)", tx(90), True)
+    reset(); prev(100); check("step 100 -> %d (down<=%d)" % (100 - MAX_RATE_DOWN, MAX_RATE_DOWN), tx(100 - MAX_RATE_DOWN), True)
 
     # 3. Engaged, exceeds rate limit -> BLOCKED
     print("\n=== 3. Rate limit violations ===")
-    reset(); check("jump 0 -> +11 (>rate_up)", tx(11), False)
-    reset(); check("jump 0 -> +800", tx(800), False)
+    reset(); check("jump 0 -> +%d (>rate_up)" % (MAX_RATE_UP + 1), tx(MAX_RATE_UP + 1), False)
+    reset(); check("jump 0 -> +%d" % MAX_TORQUE, tx(MAX_TORQUE), False)
     reset(); prev(100); check("drop 100 -> 70 (toward-zero allowed)", tx(70), True)
 
     # 4. Over max torque -> BLOCKED even at correct rate
     print("\n=== 4. Absolute torque limit ===")
-    reset(); prev(795); check("795 -> 800 (=limit)", tx(800), True)
-    reset(); prev(795); check("795 -> 801 (>limit)", tx(801), False)
-    reset(); prev(800); check("hold at 805 (>limit)", tx(805), False)
+    reset(); prev(MAX_TORQUE - MAX_RATE_UP); check("%d -> %d (=limit)" % (MAX_TORQUE - MAX_RATE_UP, MAX_TORQUE), tx(MAX_TORQUE), True)
+    reset(); prev(MAX_TORQUE - MAX_RATE_UP); check("%d -> %d (>limit)" % (MAX_TORQUE - MAX_RATE_UP, MAX_TORQUE + 1), tx(MAX_TORQUE + 1), False)
+    reset(); prev(MAX_TORQUE); check("hold at %d (>limit)" % (MAX_TORQUE + 5), tx(MAX_TORQUE + 5), False)
 
     # 5. DRIVER OVERRIDE — human torque must limit the system
     print("\n=== 5. Driver override (human applies torque) ===")

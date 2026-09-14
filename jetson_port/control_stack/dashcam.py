@@ -97,9 +97,23 @@ class CarStateFromCAN:
         # ACC set speed off CRZ_EVENTS. -1 means "never decoded", which is
         # distinguishable from a genuine 0 -- a controller must not treat an
         # absent set speed as "the driver asked for zero".
+        #
+        # THESE THREE ARE A LATCH, NOT A LIVE READ. They hold the last decoded
+        # value forever and are never invalidated when 0x21F stops arriving, so
+        # a stale reading is indistinguishable from a live one BY VALUE. -1
+        # only means "never arrived since this object was built" -- on a car
+        # that was awake at startup, 0x21F latches before suppression and the
+        # field then reads plausible for the rest of the run.
+        #
+        # That is exactly what made "0x21F vanishes under radar suppression"
+        # unfalsifiable from the logs: every suppressed run shows raw=100 (the
+        # idle value latched at startup) and the -1 runs are the ones where the
+        # car was ASLEEP from the start. set_speed_t is the field that settles
+        # it -- 0.0 means never seen, and anything else is a real arrival time.
         self.set_speed_raw = -1
         self.set_speed_kph = -1.0
         self.set_speed_ms = -1.0
+        self.set_speed_t = 0.0
         # PEDALS-derived MRCC state -- see the PEDALS branch in update().
         self.acc_armed = False
         self.acc_active = False
@@ -110,6 +124,10 @@ class CarStateFromCAN:
         self.steering_angle = 0.0
         self.rpm = 0
         self.buttons = dict(set_p=0, set_m=0, res=0, off=0)
+        # Rising edges per button since startup, and when the last one landed.
+        # See the CRZ_BTNS branch in update() for why counts and not levels.
+        self.btn_counts = dict(set_p=0, set_m=0, res=0, off=0)
+        self.btn_last_t = 0.0
         # CRZ_BTNS rolling counter. create_button_cmd() sends (counter + 1) % 16,
         # so a virtual RES/CANCEL only looks like the next frame in the car's own
         # sequence if this tracks the real one. Frozen -> every button frame
@@ -151,19 +169,35 @@ class CarStateFromCAN:
             # CRZ_SPEED : 7|16@0+ (0.005, -0.5) -- big-endian, start bit 7 is the
             # MSB of byte 0, so the value spans bytes 0..1.
             #
-            # UNITS ARE UNVERIFIED. factor 0.005 over 16 bits tops out at ~327,
-            # which is plausible as km/h and implausible as m/s, but the DBC does
-            # not say and this port has no capture to settle it. Stored raw and in
-            # both interpretations so one drive can decide it against the number on
-            # the dash -- rather than picking one now and silently commanding to
-            # the wrong scale later.
+            # UNITS ARE km/h. MEASURED 2026-08-12 with stock MRCC engaged and
+            # holding a set speed: raw=14582, which is 72.4 as km/h and 260.7 as
+            # m/s-converted-to-km/h. A CX-5 has no 260 km/h ACC set speed, so the
+            # m/s reading is eliminated. (72.4 km/h is also exactly 45.0 mph, so a
+            # US cluster displaying 45 is consistent with the same conclusion.)
+            #
+            # set_speed_ms is kept only so existing readers do not break; it is
+            # the disproven interpretation and nothing new should use it.
             self.set_speed_raw = (d[0] << 8) | d[1]
             _v = self.set_speed_raw * 0.005 - 0.5
             self.set_speed_kph = _v          # if the DBC unit is km/h
             self.set_speed_ms = _v           # if it is m/s (x3.6 for km/h)
+            # Arrival time, so a reader can tell a live 0x21F from a latched
+            # one. See the note on these fields in __init__ -- without this the
+            # value alone cannot answer whether suppression silences CRZ_EVENTS.
+            self.set_speed_t = time.time()
         elif addr == CRZ_BTNS:
+            _prev_btns = self.buttons
             self.buttons = dict(set_p=bit(d, 4), set_m=bit(d, 5),
                                 res=bit(d, 2), off=bit(d, 0))
+            # RISING-EDGE COUNTS, because the instantaneous state is useless to a
+            # 1 Hz diagnostic: a button is held for a few hundred ms and the
+            # sample almost always lands between presses. Two alpha-long runs on
+            # 2026-08-12 asked "did SET do anything?" and could not answer it,
+            # because nothing recorded that SET was pressed at all.
+            for _k in self.btn_counts:
+                if self.buttons[_k] and not _prev_btns.get(_k):
+                    self.btn_counts[_k] += 1
+                    self.btn_last_t = time.time()
             # CTR : 29|4@0+ -- big-endian, start bit 29 is the MSB, so byte 3
             # bits 5..2. Same start-bit convention bit() already assumes above.
             self.crz_btns_counter = (d[3] >> 2) & 0x0F

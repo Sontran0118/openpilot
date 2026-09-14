@@ -58,22 +58,93 @@ def _calib_file_path():
 #   OP_JERK_MAX    m/s^3, how fast aTarget may change -- this is what stops the
 #                  throttle stepping straight to full
 #   OP_V_MAX_KPH   km/h, speed cap: above it, positive accel is not allowed
-#   OP_T_FOLLOW    s, minimum time gap to the lead before accel is cut
+#   OP_T_FOLLOW    s, minimum time gap to the lead before accel is cut.
+#                  DEFAULT 0 = OFF: the model owns following distance. See the
+#                  long note at step 1 of govern_accel.
 _envf = lambda k, d: float(os.environ.get(k, d))
-ACCEL_MAX_CMD = _envf("OP_ACCEL_MAX", 1.2)     # openpilot's A_CRUISE_MAX at 10 m/s
+# Absolute ceiling, all speeds. Lowered 1.2 -> 0.9 alongside OP_ACCEL_SCALE so it
+# is a real guarantee rather than a number the scaled curve never reaches: at the
+# old 1.2 nothing below 0 m/s could ever hit it, so it capped nothing.
+ACCEL_MAX_CMD = _envf("OP_ACCEL_MAX", 0.9)
 JERK_MAX_CMD  = _envf("OP_JERK_MAX", 2.0)      # m/s^3
+# SPEED-DEPENDENT ACCELERATION CEILING, from openpilot's own A_CRUISE_MAX table
+# (longitudinal_planner.py:18-19). A FLAT cap is the wrong shape: 1.2 m/s^2 is
+# gentler than openpilot from a standstill (it uses 1.6) and TWICE as aggressive
+# at highway speed (it uses 0.6 at 40 m/s). The same number cannot be right at
+# both ends, and the highway end is where a brisk command is least welcome.
+#
+# The effective ceiling is min(ACCEL_MAX_CMD, interp(v_ego) * OP_ACCEL_SCALE).
+# OP_ACCEL_SCALE is the single "how eager" knob: 1.0 matches openpilot, lower is
+# gentler everywhere while keeping the speed-dependent shape.
+#
+# BRAKING IS NOT AFFECTED. govern_accel only ever clamps positive accel with
+# this -- see the docstring -- so making the car gentler cannot make it worse at
+# slowing down.
+ACCEL_MAX_BP = (0.0, 10.0, 25.0, 40.0)         # m/s
+ACCEL_MAX_V  = (1.6, 1.2, 0.8, 0.6)            # m/s^2, openpilot's own numbers
+# GENTLER EVERYWHERE, on request 2026-08-14: "reduce the acceleration at all
+# speeds". Scaling rather than reshaping keeps openpilot's curve -- brisker from
+# rest where you need to actually get moving, calmest at speed where a firm push
+# is least welcome -- and makes the reduction one reversible number.
+#
+#   v_ego        openpilot   was (0.70)   now (0.55)
+#   0 m/s   0 kph    1.60       1.12         0.88
+#   10 m/s 36 kph    1.20       0.84         0.66
+#   25 m/s 90 kph    0.80       0.56         0.44
+#   40 m/s 144 kph   0.60       0.42         0.33
+#
+# ~21% off the previous setting at every speed. Raise OP_ACCEL_SCALE back toward
+# 0.7 if it now feels too slow to reach the target; braking is untouched either
+# way, since this only ever clamps POSITIVE accel.
+ACCEL_SCALE  = _envf("OP_ACCEL_SCALE", 0.55)
+# Width of the approach taper below the speed cap, km/h. Available acceleration
+# falls linearly to zero across this band so the car SETTLES onto the limit
+# rather than overshooting and being braked back. Wider = gentler arrival and
+# more time spent slightly under the limit; narrower = closer to the old
+# hunting behaviour. 10 km/h is roughly 6 mph of run-in.
+V_TAPER_KPH = _envf("OP_V_TAPER_KPH", 10.0)
+
+
+def _max_accel_for(v_ego):
+    """Speed-dependent positive-accel ceiling, scaled and hard-capped."""
+    v = max(0.0, float(v_ego))
+    if v <= ACCEL_MAX_BP[0]:
+        base = ACCEL_MAX_V[0]
+    elif v >= ACCEL_MAX_BP[-1]:
+        base = ACCEL_MAX_V[-1]
+    else:
+        base = ACCEL_MAX_V[-1]
+        for i in range(1, len(ACCEL_MAX_BP)):
+            if v <= ACCEL_MAX_BP[i]:
+                x0, x1 = ACCEL_MAX_BP[i - 1], ACCEL_MAX_BP[i]
+                y0, y1 = ACCEL_MAX_V[i - 1], ACCEL_MAX_V[i]
+                base = y0 + (y1 - y0) * (v - x0) / (x1 - x0)
+                break
+    return min(ACCEL_MAX_CMD, base * ACCEL_SCALE)
 # Set in MPH, because that is the unit the limit was specified in. Everything
 # downstream works in m/s and the dashboard reads km/h, so the conversion lives
 # here once rather than in someone's head. OP_V_MAX_KPH still overrides directly.
 V_MAX_MPH     = _envf("OP_V_MAX_MPH", 72.0)
 V_MAX_KPH     = _envf("OP_V_MAX_KPH", V_MAX_MPH * 1.609344)
-T_FOLLOW_MIN  = _envf("OP_T_FOLLOW", 1.8)      # > get_T_FOLLOW(standard) = 1.45
+# FOLLOWING DISTANCE IS THE MODEL'S JOB. 0 disables the geometric rule entirely;
+# see step 1 of govern_accel for what it was doing and why it had to go. Set a
+# positive number to put it back (1.45 = openpilot standard, 1.25 aggressive,
+# 1.75 relaxed; this port used to hardcode 1.8, i.e. further back than relaxed).
+T_FOLLOW_MIN  = _envf("OP_T_FOLLOW", 0.0)
 # How hard each cap is allowed to pull back. Both are well inside the panda's
 # +-2000 raw window (-2.0 m/s^2 is about -820 raw) and gentler than ACCEL_MIN
 # (-3.5), so the model can still brake harder than either cap ever will.
+# Only used when OP_T_FOLLOW is set back to a positive number; the geometric
+# lead rule is off by default and the model brakes for leads itself.
 LEAD_DECEL_MAX = _envf("OP_LEAD_DECEL", 1.5)   # m/s^2 at half the target gap
 V_CAP_GAIN     = _envf("OP_VCAP_GAIN", 0.10)   # m/s^2 per km/h over the limit
 V_CAP_DECEL_MAX = _envf("OP_VCAP_DECEL", 1.0)  # m/s^2 ceiling on cap braking
+# COAST BAND above the speed-limit cap: how far the car may roll past the target
+# before the cap brakes for it. See step 2b of govern_accel. In MPH like the
+# allowances in speed_target.py, because that is the unit these were asked for.
+# 0 restores the old behaviour, where braking began the instant the target was
+# crossed. Only applies to the GPS/OSM cap -- V_MAX_KPH still brakes at itself.
+V_COAST_BAND_KPH = _envf("OP_V_COAST_BAND_MPH", 5.0) * 1.609344
 
 
 # --- longitudinal MPC ---------------------------------------------------------
@@ -102,6 +173,13 @@ V_CAP_DECEL_MAX = _envf("OP_VCAP_DECEL", 1.0)  # m/s^2 ceiling on cap braking
 # sane values, but a bound costs nothing and keeps the lead/speed/jerk caps as a
 # second line if the solver ever returns something wild.
 MPC_ENABLED = os.environ.get("OP_MPC") == "1"
+# Follow distance, via the MPC's personality parameter. log.capnp:140-144 orders
+# the enum aggressive=0, standard=1, relaxed=2, and long_mpc.py:73 maps those to
+# T_FOLLOW 1.25 / 1.45 / 1.75 s. The call sites used a bare 0, i.e. AGGRESSIVE,
+# which was almost certainly meant to read "default" -- so the car followed at the
+# tightest gap on offer with no way to change it.
+_PERSONALITY = {"aggressive": 0, "standard": 1, "relaxed": 2}.get(
+    os.environ.get("OP_PERSONALITY", "standard").strip().lower(), 1)
 
 
 class _MpcLead:
@@ -120,9 +198,28 @@ class _MpcLead:
         self.present = bool(ok)
         self.status = bool(ok)
         self.dRel = float(d) if ok else 0.0
-        # model gives lead speed RELATIVE to us in some heads and absolute in
-        # others; treat it as relative and convert, clamping to sane ground speed
-        self.vLead = float(max(0.0, v_ego + (v if (ok and v is not None) else 0.0)))
+        # THE MODEL'S LEAD VELOCITY IS ABSOLUTE. Settled 2026-08-12 from
+        # openpilot's own radard.py, which is unambiguous in three places:
+        #
+        #   :119  prob_v = laplacian_pdf(c.vRel + v_ego, lead.v[0], lead.vStd[0])
+        #   :129  vel_sane = (abs(track.vRel + v_ego - lead.v[0]) < 10)
+        #   :137  lead_v_rel_pred = lead_msg.v[0] - model_v_ego
+        #
+        # 119 and 129 compare `vRel + v_ego` -- an absolute ground speed -- against
+        # lead.v[0], and 137 derives the RELATIVE speed by SUBTRACTING v_ego from
+        # it. lead.v[0] is therefore ground speed, not closing speed.
+        #
+        # This used to add v_ego on top, which double-counted it: following a car
+        # at 30 kph while doing 30 kph told the MPC the lead was doing 60 and
+        # pulling away, so it accelerated instead of holding station, then braked
+        # hard when the gap finally collapsed. REPORTED FROM THE CAR 2026-08-12 as
+        # "does not stop when there's leads, accelerates really hard, and brakes
+        # really hard" -- all three follow from this one sign error.
+        #
+        # govern_accel never showed it because it is a bound, not a planner: it
+        # clamps the end-to-end action head, which slows for leads implicitly, and
+        # never chases a target that a wrong vLead could run away with.
+        self.vLead = float(max(0.0, v if (ok and v is not None) else 0.0))
         self.aLeadK = float(a) if (ok and a is not None) else 0.0
         self.vLeadK = self.vLead
         self.modelProb = float(prob) if ok else 0.0
@@ -135,20 +232,91 @@ class _MpcRadar:
         self.leadTwo = _MpcLead()
 
 
-def govern_accel(a_model, v_ego, lead_d, lead_prob, a_prev, dt):
+class RxLiveness:
+    """When did the bus last say anything?
+
+    A decoded VALUE can never establish liveness -- carstate fields are plain
+    assignments that hold their last value when the frames stop, which is
+    indistinguishable from the car still reporting that value. Only an arrival
+    TIME can. This is that time, shared by everything that needs to know whether
+    what it is reading is current or merely remembered.
+
+    Fails CLOSED before the first frame: at startup nothing has been observed,
+    so nothing may be asserted about the car.
+    """
+
+    # 2 s is ~6x the longest legitimate gap between bus-0 frames (PEDALS 0x165
+    # alone runs at 100 Hz), so it cannot fire on a live bus; and it is well
+    # inside the radar's own ~5 s UDS session timeout, so releasing at 2 s gets
+    # the radar back promptly rather than after a further long wait.
+    DEFAULT_DEAD_S = 2.0
+
+    def __init__(self, dead_s=None):
+        self.t = 0.0
+        self.dead_s = (_envf("OP_RX_DEAD_S", self.DEFAULT_DEAD_S)
+                       if dead_s is None else float(dead_s))
+
+    def stamp(self, now=None):
+        self.t = now if now is not None else time.time()
+
+    def alive(self, now=None):
+        if self.dead_s <= 0.0:
+            return True                      # check disabled
+        if not self.t:
+            return False                     # nothing has ever arrived
+        return ((now if now is not None else time.time()) - self.t) < self.dead_s
+
+    def age(self, now=None):
+        if not self.t:
+            return float("inf")
+        return (now if now is not None else time.time()) - self.t
+
+
+def govern_accel(a_model, v_ego, lead_d, lead_prob, a_prev, dt, v_max_kph=None):
     """Clamp the action head's raw acceleration into something drivable.
 
     Returns (a_cmd, reason). Braking is never limited by the ceiling or the
     speed cap -- only acceleration is. The jerk limit applies in both
     directions, because a step change to hard braking is as bad as one to
     full throttle.
+
+    It does NOT decide following distance. The action head already does, and
+    this function overriding it was the brake-checking -- see step 1.
     """
     a = float(a_model)
     why = ""
 
-    # 1. lead following. The model has no notion of the gap WE want to keep, so
-    #    cut acceleration once the time gap is below target and brake below half.
-    if lead_prob is not None and lead_d is not None and lead_prob > 0.5 and v_ego > 1.0:
+    # 1. LEAD FOLLOWING -- OFF BY DEFAULT. The model handles the lead itself.
+    #
+    # This used to impose a fixed 1.8 s time gap on top of the action head, with
+    # the premise "the model has no notion of the gap WE want to keep". That
+    # premise is wrong for an end-to-end model: it was trained on humans
+    # following cars, and `desiredAcceleration` already prices in the lead. So
+    # the rule was not clamping the model, it was ARGUING with it -- and the
+    # min() meant the fixed formula won every disagreement.
+    #
+    # MEASURED across this port's drive logs, 708 samples where the rule fired:
+    #
+    #   417 (59%)  the model asked for ACCELERATION and the rule commanded a
+    #              BRAKE instead -- a sign inversion, not a limit. e.g.
+    #              a_raw=+1.28 -> a_cmd=-0.71, a_raw=+0.98 -> a_cmd=-1.49
+    #   560 (79%)  fired at a gap of 1.45 s or MORE -- distances openpilot's own
+    #              standard personality considers fine
+    #   median gap at override: 1.60 s
+    #
+    # Reported from the car as brake-checking and "the distance from the lead
+    # feels hardcoded". It was: 1.8 s is further back than upstream's RELAXED
+    # personality (1.75), and at 100 km/h it began braking at 50 m and reached
+    # the full -1.5 m/s^2 by 25 m regardless of what the model saw.
+    #
+    # The safety net that remains is the one that was never in dispute: the
+    # accel ceiling, the speed cap and the jerk limit below, none of which
+    # depend on the lead. Model braking passes through untouched -- it always
+    # did, since nothing here clamps negative accel.
+    #
+    # Set OP_T_FOLLOW to a positive number to restore the rule.
+    if (T_FOLLOW_MIN > 0.0 and lead_prob is not None and lead_d is not None
+            and lead_prob > 0.5 and v_ego > 1.0):
         gap = lead_d / max(v_ego, 0.1)
         if gap < T_FOLLOW_MIN:
             # Proportional, not a step: how far inside the target gap we are, 0 at
@@ -161,16 +329,71 @@ def govern_accel(a_model, v_ego, lead_d, lead_prob, a_prev, dt):
     # 2. speed cap. Also proportional: above the limit, command braking that grows
     #    with the overshoot, so the cap HOLDS on a descent instead of merely
     #    stopping acceleration and letting gravity carry the car past it.
+    # v_max_kph is the LIVE cap when OP_SPEED_LIMIT is on -- the posted limit from
+    # GPS + OSM plus the mode's over-limit allowance (OP_STD_OVER_MPH /
+    # OP_MADS_OVER_MPH). None falls back to the fixed
+    # V_MAX_KPH, so behaviour is unchanged when no limit is available.
+    #
+    # Never ABOVE the fixed ceiling: the posted limit can only ever lower the cap.
+    # A bad lookup can make the car aim slower than it needs to; it can never let
+    # it exceed a bound that already applied.
+    _cap = V_MAX_KPH if v_max_kph is None else min(float(v_max_kph), V_MAX_KPH)
     v_kph = v_ego * 3.6
-    if v_kph > V_MAX_KPH:
-        over = v_kph - V_MAX_KPH
-        a = min(a, -min(V_CAP_DECEL_MAX, V_CAP_GAIN * over))
-        why = why or "v>%.0f (+%.1f)" % (V_MAX_KPH, over)
 
-    # 3. acceleration ceiling
-    if a > ACCEL_MAX_CMD:
-        a = ACCEL_MAX_CMD
-        why = why or "accel cap"
+    # 2b. COAST BAND -- where acceleration stops is NOT where braking starts.
+    #
+    # Until now those were one number, so the instant the car touched the target
+    # the proportional braking in step 2 fired. On any downgrade, or just from the
+    # last of the taper's momentum, that is a brake-check: a short deceleration
+    # nobody asked for, to hold a speed the car was only a fraction over.
+    #
+    # Two thresholds instead. _cap is the ACCEL ceiling -- past it the car is
+    # never given throttle. _brake_at sits V_COAST_BAND_KPH higher, and only past
+    # THAT does the cap command deceleration. Between them the car rolls: no
+    # throttle, no brake, whatever the road does. With the defaults, STANDARD
+    # settles at the limit +10 mph and does not brake until +15.
+    #
+    # Only ever above a SPEED-LIMIT cap. V_MAX_KPH is the hard ceiling of this
+    # stack and keeps braking exactly at itself -- min() below means the coast
+    # band can never carry the car past it.
+    _brake_at = _cap if v_max_kph is None else min(_cap + V_COAST_BAND_KPH, V_MAX_KPH)
+
+    if v_kph > _brake_at:
+        over = v_kph - _brake_at
+        a = min(a, -min(V_CAP_DECEL_MAX, V_CAP_GAIN * over))
+        why = why or "v>%.0f (+%.1f)" % (_brake_at, over)
+    elif v_kph > _cap:
+        # In the band. Cut throttle, command nothing else -- min(a, 0.0) rather
+        # than a = 0.0 so a lead-following brake from step 1 still gets through.
+        a = min(a, 0.0)
+        why = why or "coast +%.0f" % (v_kph - _cap)
+
+    # 3. acceleration ceiling -- speed-dependent, see _max_accel_for
+    _amax = _max_accel_for(v_ego)
+
+    # 3b. TAPER THE APPROACH TO THE CAP.
+    #
+    # Step 2 only reacts AFTER the cap is crossed, so the model accelerated at the
+    # full ceiling right up to the limit, overshot because nothing slowed the
+    # approach, got braked back, fell under, and accelerated again. That is speed
+    # hunting -- "rush to the limit, brake, go over, brake" -- and it is a
+    # property of a cap with no approach region, not of the model.
+    #
+    # Scale the ceiling down linearly over the last V_TAPER_KPH so available
+    # acceleration reaches zero exactly AT the cap. The car then settles onto the
+    # limit instead of colliding with it, and step 2's braking becomes a backstop
+    # for descents rather than the normal way of arriving.
+    #
+    # Braking is untouched: this only ever lowers a POSITIVE ceiling.
+    _head = _cap - v_kph
+    if _head < V_TAPER_KPH:
+        _amax = min(_amax, _amax * max(0.0, _head) / V_TAPER_KPH)
+        if a > _amax:
+            why = why or "approach %.0f" % _cap
+
+    if a > _amax:
+        a = _amax
+        why = why or "accel cap %.2f" % _amax
 
     # 4. jerk limit, applied LAST so nothing above can step the output
     da = JERK_MAX_CMD * max(dt, 1e-3)
@@ -254,6 +477,24 @@ PANDA_STATUS_FILE = os.environ.get(
 # worth attempting: there is no reverse-engineered formula to get wrong, only a
 # counter to keep moving.
 RADAR_CTR_IDS = (0x361, 0x362, 0x363, 0x364, 0x365)
+# Of the seven, the two the DBC defines no varying signals for. Replaying these
+# indefinitely asserts nothing that can go stale, so the shadow age gate skips
+# them; every other address is treated as carrying road content that expires.
+RADAR_STATIC_IDS = (0x366, 0x499)
+# How long a captured radar frame may keep being replayed. Long enough to cover
+# the arming sequence and a normal pull-away, short enough that a frozen lead
+# does not survive into the drive it would be contradicting. Override to 0 to
+# disable the replay entirely, or to a large number for the old behaviour.
+SHADOW_MAX_AGE_S = float(os.environ.get("OP_SHADOW_MAX_AGE_S", "20"))
+# The addresses the suppression census reports on: the three longitudinal
+# frames, the two the panda gates engagement on, and the radar's other seven.
+# One line per second answering "what did suppression actually silence".
+CENSUS_IDS = (0x21b, 0x21c, 0x21f, 0x165, 0x09d,
+              0x361, 0x362, 0x363, 0x364, 0x365, 0x366, 0x499)
+# Read ONCE at import so long_tx_thread and main() cannot disagree: the thread is
+# defined long before main() computes its own copy, and a closure over a
+# later-assigned local would raise rather than read False.
+_radar_local_shadow = os.environ.get("OP_ALPHA_LOCAL_SHADOW") == "1"
 RADAR_NAMES = {0x361: "DISTANCE", 0x362: "TURN", 0x363: "363", 0x364: "364",
                0x365: "365", 0x366: "366_STATIC", 0x499: "499_STATIC"}
 # See the block in carstate_thread() where this is applied.
@@ -330,6 +571,13 @@ def check_safety_limits(lkas_hz, params):
 STATE = {
     "t": 0.0, "frames": 0, "fps": 0.0, "n_dets": 0, "n_placed": 0,
     "v_ego_kph": 0.0, "rpm": 0,
+    # Posted limit and the target derived from it (OP_SPEED_LIMIT=1). None until
+    # the first successful GPS+OSM lookup, which is what the HUD draws "--" for.
+    # speed_limit_inferred marks a limit guessed from the highway type rather
+    # than an explicit maxspeed tag -- ~89% of ways in the extract -- and the HUD
+    # shows those differently so a guess never looks like a posting.
+    "speed_limit_kph": None, "speed_limit_inferred": False,
+    "speed_target_kph": None, "speed_limit_mode": "",
     "cruise_available": False, "cruise_enabled": False,
     # Default so the page renders the stock cruise fields until a panda role that
     # actually knows the mode overwrites it. See the note in the status writer.
@@ -441,11 +689,35 @@ async function tick(){
   // with the panda log showing acc_armed=1, op=enabled, ctrl_allowed=1 at the same
   // instant. acc_armed is the field that follows the button in this mode, so
   // prefer it and say which one is being shown.
+  // ...AND UNDER ALPHA LONG cruise_enabled IS NOT MERELY WRONG, IT IS FROZEN.
+  //
+  // The `_act || s.cruise_enabled` fallback below was the bug behind "why is
+  // cruise state stale". Both cruise_available and cruise_enabled decode from
+  // 0x21c, the radar's frame. Suppress the radar and NOTHING on bus 0 sends it
+  // any more -- our own copies come back tagged (bus + 128) and cs_can.update
+  // only decodes bus == 0 -- so the two fields keep whatever value they last
+  // saw, for the rest of the drive.
+  //
+  // MEASURED 2026-08-11 over a full alpha-long run: 175/175 samples read
+  // `crz_avail=0 crz_en=1`, which is self-contradictory (active but not
+  // available) and is the signature of a field nothing is writing. With
+  // cruise_enabled latched at 1, `_act || s.cruise_enabled` is permanently
+  // true, so the page showed ENGAGED (long) forever -- while acc_armed and
+  // acc_active, the fields that actually follow the car, were both false.
+  //
+  // So under alpha long use ONLY the PEDALS-derived pair. acc_active is the
+  // PCM's own report of stock ACC, acc_armed is MRCC MAIN, and both keep
+  // updating with the radar muted -- which is exactly why mazda.h gates alpha
+  // long on PEDALS too. Outside alpha long the radar is alive and 0x21c is
+  // trustworthy, so nothing changes there.
   var _al = !!s.alpha_long, _armed = !!s.acc_armed, _act = !!s.acc_active;
-  var _on  = _al ? (_act || s.cruise_enabled) : s.cruise_enabled;
+  var _on  = _al ? _act : s.cruise_enabled;
   var _av  = _al ? _armed : s.cruise_available;
+  // Name the source. A frozen field that LOOKS live is what cost the time here,
+  // so say which signal the readout is coming from rather than implying the
+  // radar-sourced one is still meaningful.
   document.getElementById('crz').textContent =
-      (_on?'ENGAGED':(_av?(_al?'armed':'available'):'off')) + (_al?' (long)':'');
+      (_on?'ENGAGED':(_av?(_al?'armed':'available'):'off')) + (_al?' (PEDALS, radar muted)':'');
   document.getElementById('crz').className='v '+(_on?'ok':(_av?'warn':''));
   document.getElementById('op').textContent=s.op_state+(s.lat_active?' / lat':'');
   document.getElementById('op').className='v '+(s.op_enabled?'ok':'');
@@ -1052,6 +1324,66 @@ def draw_seg(img, st):
             break
 
 
+def draw_speed_limit_sign(img, st, hud):
+    """US-style speed-limit plate, top-right of the HUD.
+
+    Drawn as a SIGN rather than another text row on purpose: the limit is the one
+    number you check at a glance while driving, and a white plate in the corner is
+    found by shape without reading. --display serves no web page, so this is the
+    only place the posted limit is visible in the mode used on the road.
+
+    An INFERRED limit -- guessed from the highway type because the way carries no
+    maxspeed tag, which is ~89% of the New York extract -- is drawn amber with a
+    '?' so it can never be mistaken for a real posting. SpeedTarget already
+    discounts those; this makes the discount visible.
+    """
+    lim = st.get("speed_limit_kph")
+    h, w = img.shape[:2]
+    scale = max(0.7, min(1.6, hud * 0.55))
+    pw, ph = int(150 * scale), int(190 * scale)
+    x1, y1 = w - pw - int(16 * scale), int(16 * scale)
+    x2, y2 = x1 + pw, y1 + ph
+
+    inferred = bool(st.get("speed_limit_inferred"))
+    border = (0, 170, 220) if inferred else (40, 40, 40)
+
+    cv2.rectangle(img, (x1, y1), (x2, y2), (255, 255, 255), -1)
+    cv2.rectangle(img, (x1, y1), (x2, y2), border, max(2, int(5 * scale)))
+
+    def _centre(text, cy, fs, thick, col):
+        (tw, th), _ = cv2.getTextSize(text, cv2.FONT_HERSHEY_SIMPLEX, fs, thick)
+        cv2.putText(img, text, (x1 + (pw - tw) // 2, cy + th // 2),
+                    cv2.FONT_HERSHEY_SIMPLEX, fs, col, thick, cv2.LINE_AA)
+
+    _centre("SPEED", y1 + int(30 * scale), 0.5 * scale, max(1, int(2 * scale)), (20, 20, 20))
+    _centre("LIMIT", y1 + int(58 * scale), 0.5 * scale, max(1, int(2 * scale)), (20, 20, 20))
+    if lim is None:
+        _centre("--", y1 + int(120 * scale), 1.7 * scale, max(2, int(4 * scale)), (90, 90, 90))
+    else:
+        # mph on the plate: this is a US sign and the extract is New York.
+        _centre("%.0f" % (lim * 0.621371), y1 + int(122 * scale),
+                1.9 * scale, max(2, int(5 * scale)), (10, 10, 10))
+        if inferred:
+            _centre("?", y1 + int(172 * scale), 0.7 * scale,
+                    max(1, int(2 * scale)), (0, 140, 200))
+    # What the car is actually aiming for, under the plate -- both modes add
+    # an over-limit allowance on top, so target and limit are not the same
+    # number and showing only one of them would be misleading.
+    tgt = st.get("speed_target_kph")
+    if tgt is not None:
+        lbl = "tgt %.0f" % (tgt * 0.621371)
+        if st.get("speed_limit_mode") == "MADS":
+            lbl += " +"
+        (tw, th), _ = cv2.getTextSize(lbl, cv2.FONT_HERSHEY_SIMPLEX, 0.55 * scale, 2)
+        tx = x1 + (pw - tw) // 2
+        ty = y2 + int(26 * scale)
+        cv2.putText(img, lbl, (tx, ty), cv2.FONT_HERSHEY_SIMPLEX, 0.55 * scale,
+                    (0, 0, 0), max(3, int(4 * scale)), cv2.LINE_AA)
+        cv2.putText(img, lbl, (tx, ty), cv2.FONT_HERSHEY_SIMPLEX, 0.55 * scale,
+                    (0, 255, 120), max(1, int(2 * scale)), cv2.LINE_AA)
+    return img
+
+
 def overlay(frame, st, src_wh=None, minimal=False):
     """Draw the model's path and key state onto the frame the phone sees."""
     img = frame.copy()
@@ -1061,7 +1393,14 @@ def overlay(frame, st, src_wh=None, minimal=False):
     draw_model(img, st, src_wh)
     draw_dets(img, st, src_wh)
     if minimal:
-        return _hud_minimal(img, st)
+        # DISPLAY MODE ONLY. minimal=True is the --display path (the car's own
+        # monitor); the web preview takes the full text block below and already
+        # has the limit among its fields. The sign is drawn here rather than in
+        # both so it does not clutter the phone page, which was the ask.
+        img = _hud_minimal(img, st)
+        if os.environ.get("OP_SPEED_LIMIT") == "1":
+            img = draw_speed_limit_sign(img, st, float(os.environ.get("OP_HUD_SCALE", "2.2")))
+        return img
     txt = [
         f"{st['v_ego_kph']:.1f} kph   {st['rpm']} rpm",
         f"calib {' '.join(f'{x*57.2958:+.2f}' for x in st['calib_rpy'])} deg  n={st['calib_samples']}",
@@ -1212,6 +1551,10 @@ def pipeline(args):
     # --- longitudinal MPC init ------------------------------------------------
     _mpc = None
     _mpc_state = {"v": 0.0, "a": 0.0, "v_cruise": V_MAX_KPH / 3.6}
+    # Set only when OP_SPEED_LIMIT=1 and the OSM index loaded; stays None
+    # otherwise so every consumer can test it without a hasattr dance.
+    _speed_target = None
+    _sl_index = None
     _T_IDXS_MPC = None
     _CTRL_T = None
     _MPC_ACTION_T = 0.05
@@ -1230,6 +1573,69 @@ def pipeline(args):
             _T_IDXS_MPC = np.array(_T_IDXS_MPC_SRC)
             _CTRL_T = np.array(_CTRL_T_SRC)
             _mpc_state["v_cruise"] = float(os.environ.get("OP_V_TARGET_KPH", V_MAX_KPH)) / 3.6
+            # SPEED-LIMIT-AWARE TARGET, opt-in via OP_SPEED_LIMIT=1.
+            #
+            # Off by default and deliberately so: with it off this line is the
+            # only thing that sets v_cruise and the behaviour is exactly what it
+            # was. With it on, speed_target.SpeedTarget recomputes v_cruise from
+            # the GPS position against an offline OSM index, once a second.
+            #
+            #   STANDARD  target = posted limit
+            #   MADS      target = posted limit + OP_MADS_OVER_MPH (default 15 mph)
+            #
+            # The mode follows the --mads flag, so the same switch that changes
+            # how openpilot engages also changes what it aims for.
+            #
+            # THIS SETS AN AIM, NOT AN AUTHORITY. govern_accel still clamps after
+            # the MPC, V_MAX_KPH is still the ceiling, and the panda's limits are
+            # untouched. A wrong lookup makes the car aim for the wrong speed; it
+            # cannot make the car exceed a cap that already bounded it.
+            #
+            # COVERAGE, MEASURED on the New York extract: only 10.9% of drivable
+            # ways carry an explicit maxspeed tag. The rest fall back to a
+            # highway-type default and come back flagged `inferred`, which
+            # SpeedTarget discounts by OP_LIMIT_INFERRED_SCALE. Treat an inferred
+            # limit as a hint, not a posting.
+            if os.environ.get("OP_SPEED_LIMIT") == "1":
+                try:
+                    sys.path.insert(0, os.path.join(os.path.dirname(
+                        os.path.dirname(os.path.abspath(__file__)))))
+                    from gps_reader import GpsReader as _GpsReader
+                    from speed_limits import SpeedLimitIndex as _SLIndex
+                    from speed_target import SpeedTarget as _SpeedTarget
+                    _sl_index = _SLIndex()
+                    if not _sl_index.ok:
+                        print("SPEED LIMIT: index unavailable (%s) -- target stays "
+                              "at the fixed value" % _sl_index.error)
+                    else:
+                        # SPEED-TARGET MODE IS ITS OWN SWITCH.
+                        #
+                        # It used to follow --mads, which conflated two unrelated
+                        # things under one flag:
+                        #   SpeedTarget mode   STANDARD = limit + OP_STD_OVER_MPH
+                        #                      MADS     = limit + OP_MADS_OVER_MPH
+                        #   LATERAL MADS       DisengageOnAccelerator=False (1437)
+                        #                      OP_DISENGAGE_ON_BRAKE=0      (1872)
+                        #
+                        # Asking for the higher speed target therefore also stopped
+                        # openpilot disengaging on the gas AND on the brake. That is
+                        # a substantial change to override behaviour, bought by
+                        # accident while reaching for a cruise-target offset.
+                        #
+                        # OP_SPEED_LIMIT_MODE selects the target mode alone.
+                        # Unset, it still follows --mads so existing invocations
+                        # behave as before.
+                        _slm = os.environ.get("OP_SPEED_LIMIT_MODE", "").strip().lower()
+                        _sl_mads = bool(mads) if _slm == "" else (_slm == "mads")
+                        _speed_target = _SpeedTarget(
+                            mads=_sl_mads, v_max_kph=V_MAX_KPH,
+                            index=_sl_index, gps=_GpsReader().start())
+                        print("SPEED LIMIT: %s mode, %d segments, GPS on %s"
+                              % (_speed_target.status()["mode"],
+                                 _sl_index.status()["segments"],
+                                 os.environ.get("OP_GPS_PORT", "/dev/ttyTHS1")))
+                except Exception as _sle:
+                    print("SPEED LIMIT: disabled --", _sle)
             # action_t is how far ahead the plan is sampled; it must carry the
             # SAME longitudinal delay the car has, or the MPC's smooth profile is
             # applied at the wrong moment. CP.longitudinalActuatorDelay is 0.36 for
@@ -1242,6 +1648,42 @@ def pipeline(args):
             print("MPC: unavailable (%s: %s) -- falling back to govern_accel" % (type(_e).__name__, _e))
     else:
         print("MPC: off (govern_accel clamp only); set OP_MPC=1 to enable")
+        # SPEED LIMIT ON THE e2e PATH.
+        #
+        # The initialisation above lives inside `if MPC_ENABLED:`, which coupled
+        # two unrelated things. A posted limit is just a CAP, and govern_accel
+        # already HAS a speed cap -- it was applying the constant V_MAX_KPH where
+        # it could apply the live limit. So with the MPC off (the e2e path, which
+        # is the configuration that actually drives this car well) the GPS and the
+        # 8.3M-segment OSM index went unused and the only ceiling was
+        # OP_V_MAX_MPH's fixed 72 mph.
+        #
+        # Same construction, run again here so BOTH paths get the target: the MPC
+        # consumes it as a cruise target, govern_accel as a dynamic cap.
+        if os.environ.get("OP_SPEED_LIMIT") == "1":
+            try:
+                sys.path.insert(0, os.path.join(os.path.dirname(
+                    os.path.dirname(os.path.abspath(__file__)))))
+                from gps_reader import GpsReader as _GpsReader
+                from speed_limits import SpeedLimitIndex as _SLIndex
+                from speed_target import SpeedTarget as _SpeedTarget
+                _sl_index = _SLIndex()
+                if not _sl_index.ok:
+                    print("SPEED LIMIT: index unavailable (%s) -- cap stays at "
+                          "the fixed V_MAX_KPH" % _sl_index.error)
+                else:
+                    _slm = os.environ.get("OP_SPEED_LIMIT_MODE", "").strip().lower()
+                    _sl_mads = bool(mads) if _slm == "" else (_slm == "mads")
+                    _speed_target = _SpeedTarget(
+                        mads=_sl_mads, v_max_kph=V_MAX_KPH,
+                        index=_sl_index, gps=_GpsReader().start())
+                    print("SPEED LIMIT: %s mode, %d segments, GPS on %s "
+                          "(e2e path -- feeds govern_accel's cap)"
+                          % (_speed_target.status()["mode"],
+                             _sl_index.status()["segments"],
+                             os.environ.get("OP_GPS_PORT", "/dev/ttyTHS1")))
+            except Exception as _sle:
+                print("SPEED LIMIT: disabled --", _sle)
 
     p_ = Params()
     p_.put("CarParams", CP.to_bytes())
@@ -1421,6 +1863,15 @@ def pipeline(args):
                 # was permanent, because nothing ever re-asserted it. See the
                 # watchdog in tx_thread for why that is the whole ballgame.
                 "remodes": 0, "panda_resets": 0, "uptime_last": 0,
+                # The safety PARAM the panda is supposed to be holding, stashed
+                # at arm time. Bit 0 is MAZDA_PARAM_LONGITUDINAL: with it clear
+                # the firmware selects the 3-entry stock tx table and rejects
+                # EVERY 0x21b/0x21c/0x764 frame, while can_send still succeeds
+                # and long_tx_frames still climbs. The watchdog below used to
+                # re-assert the mode with a hardcoded 0, which silently turned
+                # alpha long off after any board reset and looked exactly like
+                # "the car ignores our acceleration".
+                "safety_param": 0, "param_fixups": 0,
                 # --- headroom telemetry -------------------------------------
                 # applied_peak is what actually went on the wire AFTER the rate
                 # limiter; want_peak is what the controller asked for BEFORE it.
@@ -1839,6 +2290,53 @@ def pipeline(args):
     _last_ds = {"v": None}
     from opendbc.car.mazda import longitudinal as _mazda_long
     radar_shadow_state = {"sent": 0}   # frames replayed, surfaced in the log
+    # ENGAGE-FIRST takeover gate. Open by default: every mode other than
+    # OP_ALPHA_ENGAGE_FIRST transmits from the moment its thread starts, exactly
+    # as before. See the takeover watcher at the arm site.
+    longtx_gate = {"on": True}
+    # Tester-present gate. False lets the radar's UDS session lapse so it comes
+    # back with FCW/AEB/SBS. Only engage-first's re-arm loop ever drops it; every
+    # other mode holds the session for the whole run exactly as before.
+    radar_hold = {"on": True}
+
+    # ---- SUPPRESSION DEAD-MAN'S SWITCH ---------------------------------------
+    #
+    # THE RADAR MUTE MUST FAIL OPEN. Everything else in this stack already fails
+    # safe when the host loses the bus -- the panda drops to SAFETY_NOOUTPUT,
+    # openpilot disengages itself -- but the radar mute was held by a TX-only
+    # timer with nothing checking that the host could still see the car. So a
+    # dead RX link left the car with no FCW/AEB/SBS for as long as the process
+    # ran, and no input could end it, because the release that ends it is
+    # triggered by RX.
+    #
+    # MEASURED ON THE CAR 2026-08-13 (drivelogs/cb3_panda.log):
+    #
+    #   t=115.5s  handover 1, radar suppressed
+    #   t=134.6s  RELEASE: ACC ended, tester-present stopped
+    #   t=140.6s  RELEASE COMPLETE: radar alive again after 6.0 s   <- worked
+    #   t=588.5s  handover 2 at 80 kph, radar suppressed again
+    #   t=676.7s  the USB feed dies: 21f=0 165=0 09d=0, whole bus gone
+    #   t=940.3s  STILL suppressing. tp=11059 tester-present frames sent blind.
+    #
+    # 264 seconds of suppression that no brake, cancel or MAIN-off could clear,
+    # and the car logged fault codes in the camera/cluster/PCM the whole time.
+    #
+    # THE MECHANISM. The release waits on `cs_can.acc_active`, decoded from
+    # PEDALS 0x165. That is a plain assignment (dashcam.py:293) with no expiry,
+    # so when the frames stopped it held True forever and the wait never ended.
+    # Exactly the same shape as the set_speed_raw latch fixed earlier this
+    # session: a decoded field used as a liveness condition without one.
+    #
+    # The rule here: a decoded VALUE can never establish liveness. Only an
+    # arrival TIME can. rx_alive() is that time, and every consumer of the
+    # suppression asks it.
+    rx_live = RxLiveness()
+    rx_alive = rx_live.alive
+
+    # addr -> how many frames WE have put on the bus at that address. can_census
+    # counts every frame can_thread sees, including the echo of our own transmits,
+    # so any "is the car still sending this?" question has to subtract this first.
+    _ourtx = {}
     ang_off = {"v": 0.0, "n": 0}   # learned steering angle offset, deg
     import collections as _c
     lat_trace = {"on": os.environ.get("OP_LAT_TRACE") == "1", "t": 0.0,
@@ -2089,6 +2587,16 @@ def pipeline(args):
                 tx_sched["recv_ms"] = (_d_ms if _d_ms > tx_sched["recv_ms"]
                                        else 0.85 * tx_sched["recv_ms"] + 0.15 * _d_ms)
                 tx_sched["last_recv_t"] = time.time()
+                if msgs:
+                    # RX LIVENESS, for the suppression dead-man's switch.
+                    #
+                    # One timestamp, updated wherever frames actually arrive, so
+                    # every consumer asks the same question: "has the bus said
+                    # anything lately?" Decoded fields cannot answer it -- they
+                    # are plain assignments that HOLD their last value when the
+                    # frames stop, which is indistinguishable from the car still
+                    # reporting that value. See rx_alive().
+                    rx_live.stamp()
                 for addr, d, bus in msgs:
                     # Census BEFORE the dispatch below, which only looks at the
                     # handful of addresses this stack decodes. The question this
@@ -2125,6 +2633,14 @@ def pipeline(args):
                         # was the ONLY difference between the radar's 0x21c and
                         # ours (0x13 vs 0x0b), and the front camera warning began
                         # flickering exactly when our frame took over.
+                        if addr == 0x21B:
+                            # Same reasoning as 0x21c below: CRZ_INFO_TEMPLATE is a
+                            # hardcoded guess whose static bytes (2, 5, 6) do not
+                            # match this car, and every frame we send carries them.
+                            try:
+                                _mazda_long.set_observed_crz_info(bytes(d))
+                            except Exception:
+                                pass
                         if addr == 0x21C:
                             try:
                                 # Remember the radar's byte 2 for whichever state
@@ -3124,9 +3640,36 @@ def pipeline(args):
                         if _h[0] < tx_state["uptime_last"]:
                             tx_state["panda_resets"] += 1
                         tx_state["uptime_last"] = _h[0]
-                        if _h[12] != SAFETY_MAZDA:
-                            panda.control_write(0xdc, SAFETY_MAZDA, 0)
-                            tx_state["remodes"] += 1
+                        # BOTH halves matter. _h[12] is health_t.safety_mode and
+                        # _h[13] is health_t.safety_param -- the watchdog only ever
+                        # checked the mode, and re-asserted it with a hardcoded 0,
+                        # which CLEARS MAZDA_PARAM_LONGITUDINAL. mazda_init() reads
+                        # bit 0 of that param to pick between MAZDA_TX_MSGS (3
+                        # entries) and MAZDA_LONG_TX_MSGS (22). Drop it and the tx
+                        # hook rejects every 0x21b, 0x21c and 0x764 we send, for the
+                        # rest of the drive, with no error anywhere on our side:
+                        # can_send still returns success, long_tx_frames still
+                        # climbs at the nominal rate, long_tx_err stays 0. The only
+                        # visible symptom is that the car never responds -- which is
+                        # indistinguishable from "the PCM rejects our frames" and is
+                        # precisely the wrong conclusion to draw.
+                        #
+                        # A mode that is right with a param that is wrong was
+                        # entirely invisible before, so check and repair both.
+                        _want_param = int(tx_state["safety_param"])
+                        if _h[12] != SAFETY_MAZDA or _h[13] != _want_param:
+                            _param_only = (_h[12] == SAFETY_MAZDA)
+                            panda.control_write(0xdc, SAFETY_MAZDA, _want_param)
+                            if _param_only:
+                                tx_state["param_fixups"] += 1
+                                print("PANDA   safety param was %d, want %d "
+                                      "(alpha long was silently OFF) -- re-asserted"
+                                      % (_h[13], _want_param), flush=True)
+                            else:
+                                tx_state["remodes"] += 1
+                                print("PANDA   safety mode was %d, want %d -- "
+                                      "re-asserted with param %d"
+                                      % (_h[12], SAFETY_MAZDA, _want_param), flush=True)
                             # The firmware's desired_torque_last is 0 after a
                             # mode change, so ours must be too or every frame
                             # fails the rate check (same lockout as a resync).
@@ -3515,7 +4058,35 @@ def pipeline(args):
         """
         from opendbc.car.mazda.carcontroller import CarController as MazdaCarController
         from opendbc.car.mazda.longitudinal import CRZ_CTRL_ADDR, CRZ_INFO_ADDR, RADAR_ADDR
-        LONG_ADDRS = {CRZ_INFO_ADDR, CRZ_CTRL_ADDR, RADAR_ADDR}
+        # Heartbeat ids included: create_radar_heartbeat_messages emits
+        # 0x361-0x366 and 0x499 on BOTH buses, and without them here the
+        # filter below drops the very frames that reach the camera.
+        _txlog = {"t": 0.0}     # rate limiter for the LONGTX transmit log
+        # SET-BUTTON HANDSHAKE.
+        #
+        # VERIFIED 2026-08-11 at the transmit point: when openpilot engages we send
+        #     0x21b 01 ff e1 80 06 80 0d 0b     0x21c 0a 01 8b 40 00 00 10 00
+        # on BOTH buses, counter and checksum tracking, longActive=1, accel=+2.00 --
+        # and acc_active (the PCM's own report on PEDALS 0x165) stays 0. The frames
+        # are right; the PCM simply does not enter ACC on CRZ_INFO.ACC_ACTIVE alone.
+        #
+        # In the stock system the driver presses SET, the RADAR observes it on
+        # CRZ_BTNS and activates. With the radar suppressed nobody plays that part:
+        # alpha long engages on MRCC MAIN (acc_armed), so the car never sees a set
+        # event, and we announce "ACC active" for a cruise that was never set.
+        #
+        # So play it. One short SET press when longActive is true and the PCM still
+        # has not activated, retried at a slow cadence and capped -- if this is not
+        # the mechanism, it must not turn into a button spammer.
+        from opendbc.car.mazda.values import Buttons as _Btns
+        _setbtn = {"t": 0.0, "n": 0, "max": int(os.environ.get("OP_SET_HANDSHAKE_MAX", "6")),
+                   # OFF by default now. It fired on longActive, which under the
+                   # PCM engagement order already implies acc_active=1 -- so it can
+                   # never trigger, and a synthetic SET press is the driver's call
+                   # to make, not ours. OP_SET_HANDSHAKE=1 to re-enable.
+                   "on": os.environ.get("OP_SET_HANDSHAKE", "0") == "1"}
+        LONG_ADDRS = {CRZ_INFO_ADDR, CRZ_CTRL_ADDR, RADAR_ADDR,
+                      0x361, 0x362, 0x363, 0x364, 0x365, 0x366, 0x499}
 
         # CarController.__init__ does CANPacker(dbc_names[Bus.pt]); this process
         # only ever built a bare CANPacker('mazda_2017'), so hand it the dict form.
@@ -3527,8 +4098,22 @@ def pipeline(args):
         # off raw CAN), so the fields carcontroller actually touches are mirrored
         # onto a shim. Anything it reads that is NOT set here would raise on first
         # use rather than silently read a default -- which is the intent.
+        class _CruiseState:
+            # go-no-malfunction's carcontroller reads CS.out.cruiseState.available to
+            # drive crz_available, which pairs CRZ_AVAILABLE in CRZ_CTRL with
+            # ACC_SET_ALLOWED in CRZ_INFO -- the synthetic pre-engage state our old
+            # static templates could not express.
+            #
+            # Without it update() raises '_Out' object has no attribute
+            # 'cruiseState' on EVERY cycle, so no longitudinal frame is ever built:
+            # MEASURED 2026-08-11, tester-present at 129 and long_tx/crz_info at 0.
+            # The thread's own error print is what surfaced it -- worth keeping in
+            # mind that a shim missing one attribute silences the whole path.
+            available = False
+
         class _Out:
-            pass
+            def __init__(self):
+                self.cruiseState = _CruiseState()
 
         # CarController.update() builds the LKAS and HUD frames unconditionally,
         # outside every openpilotLongitudinalControl gate -- create_steering_control
@@ -3576,7 +4161,32 @@ def pipeline(args):
             # expire the radar's ~5 s S3 timeout, which is the lapse we measured
             # at ~14 s. 10 Hz means ~50 chances per timeout window instead of 10.
             # Cheap insurance: one 8-byte frame, and the radar ignores extras.
-            if now - tp_last >= 0.1:
+            # radar_hold gates the keep-alive. Dropping it is how the RADAR IS
+            # RELEASED: the session lapses on its own within ~5 s and the radar
+            # comes back with FCW/AEB/SBS. FINDINGS establishes that this is the
+            # clean exit -- explicitly requesting the default session makes this
+            # radar fault. Always true outside engage-first's re-arm loop.
+            # DEAD-MAN'S SWITCH. If the bus has gone quiet we have no way to know
+            # whether ACC is still on, so we have no business holding the radar
+            # muted -- and no way to ever release it, since the release watches
+            # RX. Drop the hold; the session lapses on its own in ~5 s and the
+            # car returns to stock with FCW/AEB/SBS back. Latched, not momentary:
+            # re-suppressing the instant a frame trickles through would flap the
+            # radar in and out of a programming session, which is worse than
+            # either state. The re-arm loop restores it deliberately, from a
+            # fresh handover, once the link is genuinely healthy again.
+            if radar_hold["on"] and not rx_alive(now):
+                radar_hold["on"] = False
+                tx_state["radar_released_rx_dead"] = \
+                    tx_state.get("radar_released_rx_dead", 0) + 1
+                print("\n>>> RX DEAD (%.1f s with no bus-0 frame): RELEASING THE "
+                      "RADAR.\n    The mute is not safe to hold when we cannot see "
+                      "the car -- the\n    release is RX-driven, so holding it here "
+                      "would be unclearable.\n    Session lapses in ~5 s; "
+                      "FCW/AEB/SBS come back."
+                      % rx_live.age(now), flush=True)
+
+            if now - tp_last >= 0.1 and radar_hold["on"]:
                 tp_last = now
                 tx_due.set()
                 try:
@@ -3588,12 +4198,21 @@ def pipeline(args):
                 finally:
                     tx_due.clear()
 
-            if coexist:
+            if coexist or (engage_first and not tx_state.get("handover_done")):
                 # The radar is deliberately alive in this mode, so its 0x21b is not
                 # evidence of a lapsed session -- it is the design. Firing the
                 # re-suppression watchdog here would try to silence a radar we chose
                 # to keep, and then halt transmit when it failed.
-                pass
+                #
+                # engage_first is the same situation until the handover completes:
+                # the radar owns 0x21b by design until the PCM has entered ACC. The
+                # watchdog becomes correct again the moment handover_done is set.
+                #
+                # Rebaseline while skipping, or the first window AFTER the handover
+                # counts every frame the radar sent during the whole engage-first
+                # phase as "foreign" and halts transmit on the spot.
+                watch.update(t=now, census=can_census[0].get(CRZ_INFO_ADDR, 0),
+                             ours=tx_state.get("crz_info_tx", 0))
             elif now - watch["t"] >= 2.0:
                 _c = can_census[0].get(CRZ_INFO_ADDR, 0)
                 _o = tx_state.get("crz_info_tx", 0)
@@ -3651,7 +4270,11 @@ def pipeline(args):
             # we generate 0x21c, so reading availability back off it is circular --
             # acc_armed comes from PEDALS, which is the PCM's own report and what
             # the panda gates on.
-            _mazda_long.set_cruise_available(bool(getattr(cs_can, "acc_armed", False)))
+            # Guarded: the pristine vendored longitudinal.py has no such hook. See
+            # the baseline-test note in interface.py.
+            if hasattr(_mazda_long, "set_cruise_available"):
+                _mazda_long.set_cruise_available(bool(getattr(cs_can, "acc_armed", False)))
+            shim.out.cruiseState.available = bool(getattr(cs_can, "acc_armed", False))
             shim.out.vEgo = float(cs_can.v_ego)
             shim.out.standstill = bool(cs_can.v_ego < 0.3)
             shim.out.gasPressed = bool(cs_can.gas_pressed)
@@ -3674,10 +4297,88 @@ def pipeline(args):
                     print("long_tx: CarController.update failed:", e)
                 continue
 
+            # WHAT WE ACTUALLY PUT ON THE WIRE, logged at the transmit point.
+            #
+            # Every "are we sending the right thing?" question today was answered by
+            # reading crz_en back off the bus -- and that field CANNOT move in this
+            # configuration: our own echo returns tagged (bus + 128 for returned)
+            # and cs_can.update only decodes bus == 0, so with the radar silenced
+            # nothing ever writes it. It sat at 0 and I read that as "we are not
+            # setting CRZ_ACTIVE", which the data could not support.
+            #
+            # So log the bytes here, where there is no ambiguity. Rate-limited to
+            # one line a second per address, and only while alpha long is up.
+            # Fire the SET handshake before the frames go out, so the press and the
+            # engaged CRZ_INFO land in the same window the PCM is evaluating.
+            if (_setbtn["on"] and getattr(cc, "longActive", False)
+                    and not getattr(cs_can, "acc_active", False)
+                    and _setbtn["n"] < _setbtn["max"]
+                    and (time.time() - _setbtn["t"]) >= 2.0):
+                _setbtn["t"] = time.time()
+                _setbtn["n"] += 1
+                try:
+                    _bmsg = mazdacan.create_button_cmd(
+                        packer, CP, int(getattr(cs_can, "crz_btns_counter", 0)),
+                        _Btns.SET_MINUS)
+                    tx_due.set()
+                    with panda_lock:
+                        panda.can_send(_bmsg[0], bytes(_bmsg[1]), 0)
+                    print("SETBTN  sent SET_MINUS on 0x%03x (attempt %d/%d) -- "
+                          "longActive=1 but acc_active=0"
+                          % (_bmsg[0], _setbtn["n"], _setbtn["max"]), flush=True)
+                except Exception as _e:
+                    print("SETBTN  failed:", _e, flush=True)
+                finally:
+                    tx_due.clear()
+            elif getattr(cs_can, "acc_active", False) and _setbtn["n"]:
+                # Latched: stop pressing the moment the PCM activates, and say so.
+                print("SETBTN  acc_active reached 1 after %d press(es) -- the SET "
+                      "handshake WAS the missing piece" % _setbtn["n"], flush=True)
+                _setbtn["n"] = 0
+                _setbtn["on"] = False
+
+            if sends and (time.time() - _txlog["t"]) >= 1.0:
+                _txlog["t"] = time.time()
+                _seen_ids = {}
+                for _m in sends:
+                    if _m[0] in (CRZ_INFO_ADDR, CRZ_CTRL_ADDR):
+                        _seen_ids.setdefault((_m[0], _m[2]), bytes(_m[1]))
+                if _seen_ids:
+                    print("LONGTX  " + "  ".join(
+                        "0x%03x/bus%d=%s" % (a, b, d.hex(" "))
+                        for (a, b), d in sorted(_seen_ids.items()))
+                        + "  | longActive=%d enabled=%d accel=%+.2f"
+                        % (int(getattr(cc, "longActive", False)),
+                           int(getattr(cc, "enabled", False)),
+                           float(getattr(cc.actuators, "accel", 0.0))),
+                        flush=True)
+
             for msg in sends:
                 if msg[0] not in LONG_ADDRS:
                     continue          # LKAS/HUD -- tx_thread owns those
-                if not tx_enabled and msg[0] != RADAR_ADDR:
+                # When the local replay is running it owns the radar's seven other
+                # frames, and it sends the OBSERVED bytes rather than the upstream
+                # templates. Letting the carcontroller's heartbeat through as well
+                # would put two different versions of 0x361-0x366/0x499 on the same
+                # bus at the same rate -- worse than either alone, and exactly the
+                # kind of contradiction a PCM would reject. Read the env directly:
+                # the flag is assigned later in main() than this thread is defined.
+                if _radar_local_shadow and msg[0] in RADAR_IDS:
+                    continue
+                # The carcontroller emits its own tester-present at
+                # TESTER_PRESENT_STEP. It must obey radar_hold too, or the release
+                # never happens: the keep-alive above would stop while this one
+                # kept the session alive at 2 Hz, which is more than enough to hold
+                # it, and the radar would never come back.
+                if msg[0] == RADAR_ADDR and not radar_hold["on"]:
+                    continue
+                if (not tx_enabled or not longtx_gate["on"]) and msg[0] != RADAR_ADDR:
+                    # longtx_gate is the ENGAGE-FIRST hold (OP_ALPHA_ENGAGE_FIRST).
+                    # It starts closed in that mode so the radar keeps sole ownership
+                    # of 0x21b/0x21c until the PCM has actually entered ACC, and the
+                    # takeover watcher opens it. Always open otherwise, so every
+                    # existing path behaves exactly as before.
+                    #
                     # Diagnostic mode: hold the session open with tester-present but
                     # put nothing of ours on 0x21b/0x21c, so "radar silent" can be
                     # tested apart from "we are transmitting".
@@ -3687,6 +4388,18 @@ def pipeline(args):
                     with panda_lock:
                         panda.can_send(msg[0], bytes(msg[1]), msg[2])
                     tx_state["long_tx_frames"] = tx_state.get("long_tx_frames", 0) + 1
+                    # Per-address echo count. Everything we put on bus 0 comes
+                    # back through can_thread and lands in can_census, so the
+                    # census cannot tell our frames from the radar's by itself.
+                    # The suppression census subtracts this; the 0x21b watchdog
+                    # above does the same thing with its own crz_info_tx counter.
+                    #
+                    # Bus 0 only: the census reads can_census[0], and the frame
+                    # list can carry the same address on bus 2 as well (the
+                    # go-no-malfunction variant sends both). Counting a bus-2
+                    # copy would over-subtract and make a live radar look quiet.
+                    if msg[2] == 0:
+                        _ourtx[msg[0]] = _ourtx.get(msg[0], 0) + 1
                     # ONE-SHOT DIFF against the radar's own frame, printed the first
                     # time we send each address. The PCM obeys the radar's 0x21b/0x21c
                     # and ignores ours (acc_active never reaches 1), so the bytes it
@@ -3769,7 +4482,17 @@ def pipeline(args):
             plan.append({"addr": _addr, "d": bytearray(_r["d"]),
                          "period": 1.0 / _hz, "next": time.time(),
                          "ctr": _r["d"][7] & 0x0F,
-                         "has_ctr": _addr in RADAR_CTR_IDS})
+                         "has_ctr": _addr in RADAR_CTR_IDS,
+                         # SNAPSHOT, taken once here and never refreshed. It has
+                         # to be: radar_shadow[addr]["t"] is updated by ANY frame
+                         # at that address on either bus, which includes our own
+                         # replay echoing back off bus 0 -- so re-reading it later
+                         # would show our echo's age and never expire anything.
+                         # This field is the age of THE BYTES, which is the thing
+                         # the gate below is actually reasoning about.
+                         "captured": _r.get("t", time.time()),
+                         "static": _addr in RADAR_STATIC_IDS,
+                         "expired": False})
 
         if not plan:
             print("radar shadow: NOTHING CAPTURED -- the radar was already quiet "
@@ -3788,13 +4511,69 @@ def pipeline(args):
             for p in plan:
                 if now < p["next"]:
                     continue
+                # AGE GATE. The docstring above calls a frozen lead "the part
+                # that may not work"; it did not work. MEASURED 2026-08-11: a
+                # snapshot replayed at age=113.7 s raised an FSB fault, because
+                # a lead that never moves is exactly the implausibility a
+                # sensor-fusion check exists to catch.
+                #
+                # So the dynamic frames get an expiry and the static ones do
+                # not. 0x361 DISTANCE and 0x362 TURN carry real obstacle data
+                # (see RADAR_IDS); 0x363-0x365 are undecoded and are treated as
+                # dynamic because "unknown" is not "constant". 0x366 and 0x499
+                # are the two the DBC has no varying signals for, so replaying
+                # them indefinitely asserts nothing that can go stale.
+                #
+                # Letting a dynamic frame expire brings back the front camera
+                # fault it was added to suppress. That is the correct trade: the
+                # fault is honest about the radar being gone, where a frozen
+                # lead is a false statement about the road ahead. expired is
+                # surfaced so a run can be read without guessing which happened.
+                if not p["static"] and (now - p["captured"]) > SHADOW_MAX_AGE_S:
+                    if not p["expired"]:
+                        p["expired"] = True
+                        radar_shadow_state["expired"] = \
+                            radar_shadow_state.get("expired", 0) + 1
+                        print("radar shadow: 0x%03x EXPIRED after %.0f s -- its "
+                              "content is %.0f s old and no longer describes the "
+                              "road. Replay stopped for this address; expect the "
+                              "front camera fault to return."
+                              % (p["addr"], now - p["captured"], now - p["captured"]),
+                              flush=True)
+                    continue
                 if p["has_ctr"]:
                     p["ctr"] = (p["ctr"] + 1) & 0x0F
                     p["d"][7] = (p["d"][7] & 0xF0) | p["ctr"]
                 try:
+                    # BOTH BUSES. This used to be bus 0 only, which is exactly why
+                    # the local replay was retired in favour of the carcontroller
+                    # heartbeat: the forward camera lives on bus 2 and normally
+                    # RECEIVES the radar's frames, so a bus-0-only replay left it
+                    # with nothing and raised the front camera fault.
+                    #
+                    # But the heartbeat trades that fault for WRONG CONTENT. It
+                    # sends RADAR_TRACK_EMPTY_TEMPLATES, fixed bytes from the
+                    # upstream port, and they do not match this car. MEASURED
+                    # 2026-08-11 against a census of the real radar:
+                    #     0x365  upstream fff7fe7ffbff3fc0
+                    #            this car 2faebe7ffbff07c8
+                    # -- the first four bytes differ, so that is content, not the
+                    # counter nibble the other addresses differ by. We were feeding
+                    # the PCM a frame this radar never sends.
+                    #
+                    # Replaying the OBSERVED frames on BOTH buses is the combination
+                    # that was never tried: real content, and the camera still fed.
+                    # MAZDA_LONG_TX_MSGS already permits all seven on bus 2.
                     with panda_lock:
-                        panda.can_send(p["addr"], bytes(p["d"]), 0)
+                        for _b in (0, 2):
+                            panda.can_send(p["addr"], bytes(p["d"]), _b)
                     sent += 1
+                    # ONE, not two. The replay goes out on both buses but the
+                    # census this feeds counts bus 0 only, so counting the bus-2
+                    # copy here would over-subtract and show the radar as more
+                    # silent than it is -- the exact direction of error that
+                    # would hide a radar coming back.
+                    _ourtx[p["addr"]] = _ourtx.get(p["addr"], 0) + 1
                 except Exception as _e:
                     # NOT a bare swallow. MEASURED 2026-08-11: this thread printed
                     # "replaying 7 frame(s)" and then transmitted NOTHING for whole
@@ -3948,8 +4727,61 @@ def pipeline(args):
                 # Use the same signal here so the two halves of the stack agree --
                 # a host that engages on a different flag than the panda enforces is
                 # a disagreement waiting to surface as exactly this.
-                cs.cruiseState.enabled = ((cs_can.acc_armed and not cs_can.brake_pressed)
-                                          if (mads or alpha_long) else cs_can.acc_active)
+                # ...THAT ARGUMENT IS WRONG, and it is what has blocked alpha long.
+                #
+                # It assumes the radar OWNS ACC, so muting the radar must make
+                # acc_active unreachable. The DBC says otherwise: CRZ_INFO carries
+                # ACC_SET_ALLOWED (34|1@0+), a PERMISSION bit. The radar tells the
+                # PCM whether the driver may engage; the PCM does the engaging and
+                # reports it back on PEDALS. That split is exactly why the vendored
+                # port sets pcmCruise = True. With the radar muted WE own the
+                # permission bit, so acc_active is still reachable -- provided we
+                # present the ready state and let the driver press SET.
+                #
+                # Engaging off acc_armed inverts the sequence. openpilot enables the
+                # moment MRCC MAIN comes on, so the very next CRZ_INFO asserts
+                # ACC_ACTIVE=1 with a full ACCEL_CMD while the PCM knows cruise was
+                # never set -- the radar claiming the system is running when the PCM
+                # never started it. It refuses, every time.
+                #
+                # MEASURED 2026-08-11, decoded at the transmit point: all three
+                # states ARE produced correctly --
+                #   ACC_ACTIVE=0 ACC_SET_ALLOWED=0 ACCEL_CMD=+4094   standby
+                #   ACC_ACTIVE=0 ACC_SET_ALLOWED=1 ACCEL_CMD=    +0  ready
+                #   ACC_ACTIVE=1 ACC_SET_ALLOWED=1 ACCEL_CMD= +2000  engaged
+                # -- but we never SAT in the ready state while the driver pressed
+                # SET; MAIN took us straight to commanding. And across every log
+                # this port has, acc_active=1 appears 769 times and ALL 769 have the
+                # radar transmitting (crz_avail=1). Not once from our own frames.
+                #
+                # The 2026-08-09 measurement quoted above is real but proves less
+                # than it claims: acc_active never set in that run because we never
+                # gave the PCM a state it could act on, not because it cannot.
+                #
+                # The panda stays permissive (mazda.h gates on acc_armed && !brake),
+                # so the host is now the stricter of the two gates. That is the
+                # correct direction and needs no reflash.
+                #
+                # OP_ALPHA_ENGAGE=armed restores the old behaviour for A/B without a
+                # restart of the argument.
+                if CP.pcmCruise:
+                    # Legacy paths, kept for A/B while pcmCruise is still True --
+                    # i.e. only if interface.py's alpha-long flip is reverted.
+                    if os.environ.get("OP_ALPHA_ENGAGE", "pcm") == "pcm" and not mads:
+                        cs.cruiseState.enabled = bool(cs_can.acc_active)
+                    else:
+                        cs.cruiseState.enabled = ((cs_can.acc_armed and not cs_can.brake_pressed)
+                                                  if (mads or alpha_long) else cs_can.acc_active)
+                else:
+                    # OPENPILOT OWNS ENGAGEMENT. cruiseState.enabled is the CAR's
+                    # report, and with pcmCruise False the car has none to give --
+                    # ACC_ACTIVE never rises once the radar is suppressed. It must
+                    # also stay False for a second reason: selfdrived.py:425 makes
+                    # ANY true value here a permanent cruiseMismatch when
+                    # pcmCruise is False.
+                    #
+                    # Engagement comes from buttonEnable below instead.
+                    cs.cruiseState.enabled = False
             else:
                 # MADS engagement edge, WITHOUT disengaging on every brake.
                 #
@@ -4002,6 +4834,44 @@ def pipeline(args):
                 cs.cruiseState.enabled = ((cs_can.cruise_available and not _held)
                                           if mads else cs_can.cruise_enabled)
             cs.cruiseState.speed = 25.0
+
+            # BUTTON EVENTS. This port builds carState by hand instead of running
+            # opendbc's CarState, so nothing here has ever published buttonEvents
+            # or buttonEnable -- they simply did not exist on the bus. That was
+            # invisible while pcmCruise was True, because engagement came from the
+            # car. With pcmCruise False they ARE the engagement path, and without
+            # them openpilot can never enable no matter what the panda allows.
+            #
+            # opendbc's equivalents, for reference: create_button_events() in
+            # carstate.py builds these, and CarInterfaceBase.update()
+            # (interfaces.py:261) derives buttonEnable from them.
+            _btn_now = {
+                "res": bool(cs_can.buttons.get("res")),
+                "set_m": bool(cs_can.buttons.get("set_m")),
+                "off": bool(cs_can.buttons.get("off")),
+            }
+            _btn_prev = cs_edge.setdefault("btn_state", dict.fromkeys(_btn_now, False))
+            _events = [(_k, _btn_now[_k]) for _k in _btn_now if _btn_now[_k] != _btn_prev[_k]]
+            cs_edge["btn_state"] = _btn_now
+
+            if _events:
+                _types = {"res": "accelCruise", "set_m": "decelCruise", "off": "cancel"}
+                _be = cs.init('buttonEvents', len(_events))
+                for _i, (_k, _pressed) in enumerate(_events):
+                    _be[_i].type = _types[_k]
+                    _be[_i].pressed = _pressed
+
+            # buttonEnable: "user is requesting enable, usually one frame"
+            # (car.capnp:215). MazdaCarState.update_button_enable() defines the
+            # rule for this car -- RESUME on press, SET on release -- and the
+            # panda's CRZ_BTNS branch in mazda.h arms on exactly the same two
+            # edges, deliberately. If these two ever disagree, openpilot engages
+            # while the panda drops every frame, which looks like a car ignoring
+            # us rather than a gate that has not opened.
+            cs.buttonEnable = (not CP.pcmCruise) and any(
+                (_k == "res" and _pressed) or (_k == "set_m" and not _pressed)
+                for _k, _pressed in _events)
+
             m.valid = True
             pm_cs.send('carState', m)
 
@@ -4268,9 +5138,31 @@ def pipeline(args):
         # like "the car ignores our acceleration" rather than "the firmware is in
         # the wrong mode". Must match MAZDA_PARAM_LONGITUDINAL in mazda.h.
         safety_param = 1 if alpha_long else 0
+        # Stash it so the tx_thread watchdog can repair the param, not just the
+        # mode. It used to re-assert with a hardcoded 0 and turn alpha long off.
+        tx_state["safety_param"] = safety_param
         with panda_lock:
             panda.control_write(0xdc, SAFETY_MAZDA, safety_param)
         time.sleep(0.2)
+        # READ IT BACK. Every other "is the firmware in the right mode?" question
+        # this port has asked was answered by inference; this one is one control
+        # transfer away. health_t: [12] safety_mode, [13] safety_param.
+        try:
+            with panda_lock:
+                _hh = panda.control_read(0xd2, 0, 0, 64)
+            _hv = (struct.unpack(HEALTH_FMT, _hh[:struct.calcsize(HEALTH_FMT)])
+                   if _hh and len(_hh) >= struct.calcsize(HEALTH_FMT) else None)
+            if _hv and (_hv[12] != SAFETY_MAZDA or _hv[13] != safety_param):
+                print("!!! PANDA REFUSED THE SAFETY CONFIG: mode=%d param=%d, "
+                      "wanted mode=%d param=%d. Alpha long CANNOT work in this "
+                      "state -- the tx hook will reject every 0x21b/0x21c."
+                      % (_hv[12], _hv[13], SAFETY_MAZDA, safety_param), flush=True)
+            else:
+                print("   panda safety: mode=%d param=%d (alpha long %s)"
+                      % (SAFETY_MAZDA, safety_param,
+                         "ARMED" if safety_param & 1 else "off"), flush=True)
+        except Exception as _e:
+            print("   panda safety readback failed:", _e, flush=True)
 
         # --- radar suppression handshake -----------------------------------
         # CarInterface.init() is the hook that puts the radar into a UDS
@@ -4284,38 +5176,82 @@ def pipeline(args):
         # stream has not started yet. Needs the safety param written above, since
         # 0x764 is only in the panda's tx table under MAZDA_LONG_TX_MSGS.
         radar_suppressed = False
+
+        # UDS TAP HELPERS, hoisted so BOTH suppression paths can reach them.
+        # They used to live inside the immediate-suppression branch, which
+        # engage_first deliberately skips -- so the takeover watcher closed over a
+        # name that was never bound and every handover died with
+        #   "cannot access free variable '_uds_can_recv'"
+        # MEASURED ON THE CAR 2026-08-12: the handover fired correctly at
+        # acc_active=1, the suppression then raised, and we transmitted alongside a
+        # live radar -- two writers on 0x21b/0x21c, which is what put the yellow
+        # radar warning on the cluster.
+        from opendbc.car.can_definitions import CanData as _CanData
+        from opendbc.car.mazda.longitudinal import CRZ_INFO_ADDR as _CRZ_INFO
+        from opendbc.car.mazda.longitudinal import RADAR_ADDR as _RADAR_ADDR
+
+        def _uds_can_recv(wait_for_one: bool = False):
+            # One drain of the tap is one "packet". wait_for_one blocks briefly
+            # rather than spinning, so the query does not burn its whole timeout
+            # between sending the request and the reply arriving via can_thread.
+            deadline = time.time() + 0.05
+            while True:
+                msgs = []
+                while uds_sniff["q"]:
+                    _a, _d, _b = uds_sniff["q"].popleft()
+                    msgs.append(_CanData(_a, _d, _b))
+                if msgs:
+                    return [msgs]
+                if not wait_for_one or time.time() > deadline:
+                    return []
+                time.sleep(0.002)
+
+        def _uds_can_send(msgs):
+            with panda_lock:
+                for _m in msgs:
+                    panda.can_send(_m.address, bytes(_m.dat), _m.src)
+
+        # ENGAGE FIRST, SUPPRESS SECOND.
+        #
+        # Every failure this port has had is at the ACC ENTRY transition: the PCM
+        # will not enter ACC on our synthesised CRZ_INFO/CRZ_CTRL, no matter how
+        # exactly they reproduce the radar's. MEASURED 2026-08-12 with the frames
+        # byte-identical to a real activation, the panda arming from the button,
+        # openpilot enabled and commanding up to +0.99 m/s^2: acc_active stayed 0
+        # across every sample of every run.
+        #
+        # So stop asking it to enter. Let the RADAR run the entry handshake it has
+        # always run -- driver presses SET, radar activates ACC, PCM reports
+        # acc_active=1 -- and only then take the frames over. The PCM is never
+        # asked to start ACC, only to keep obeying something it already accepts.
+        # SUSTAIN has never once been tested; only entry has, and only entry has
+        # ever failed.
+        #
+        # Ordering matters: our frames go out FIRST and the radar is silenced a
+        # beat later, so the PCM sees a brief overlap rather than a gap. A gap is
+        # what would make it drop ACC.
+        #
+        # Failure here is benign and informative: if the PCM drops ACC when the
+        # radar goes quiet, cruise disengages and the car coasts -- which is a
+        # clean answer to "does it obey us at all".
+        engage_first = os.environ.get("OP_ALPHA_ENGAGE_FIRST") == "1" and alpha_long and not coexist
+        if engage_first:
+            print(">>> ENGAGE-FIRST: radar left ALIVE. Press SET to engage stock ACC "
+                  "normally;\n    we take over 0x21b/0x21c the moment the PCM reports "
+                  "acc_active.\n    FCW/AEB/SBS stay live until that moment.")
+            longtx_gate["on"] = False        # hold our tx until the handover
+            radar_suppressed = True          # let the tx threads start (gated)
         if alpha_long and coexist:
             # No UDS, no session, no tester-present -- the radar is left entirely
             # alone. Nothing suppressed means nothing for the cluster to notice,
             # and FCW/AEB/SBS keep working throughout.
             print("radar suppression: SKIPPED (OP_ALPHA_COEXIST) -- the radar keeps "
                   "running and keeps FCW/AEB/SBS. We inject alongside it.")
-        elif alpha_long:
-            from opendbc.car.can_definitions import CanData as _CanData
-            from opendbc.car.mazda.longitudinal import CRZ_INFO_ADDR as _CRZ_INFO
-            from opendbc.car.mazda.longitudinal import RADAR_ADDR as _RADAR_ADDR
-
-            def _uds_can_recv(wait_for_one: bool = False):
-                # One drain of the tap is one "packet". wait_for_one blocks
-                # briefly rather than spinning, so the query does not burn its
-                # whole timeout between sending the request and the reply
-                # arriving via can_thread.
-                deadline = time.time() + 0.05
-                while True:
-                    msgs = []
-                    while uds_sniff["q"]:
-                        _a, _d, _b = uds_sniff["q"].popleft()
-                        msgs.append(_CanData(_a, _d, _b))
-                    if msgs:
-                        return [msgs]
-                    if not wait_for_one or time.time() > deadline:
-                        return []
-                    time.sleep(0.002)
-
-            def _uds_can_send(msgs):
-                with panda_lock:
-                    for _m in msgs:
-                        panda.can_send(_m.address, bytes(_m.dat), _m.src)
+        elif alpha_long and not engage_first:
+            # engage_first defers this whole handshake to the takeover watcher --
+            # the radar has to stay alive long enough to run the ACC entry itself.
+            # _uds_can_recv / _uds_can_send / _CRZ_INFO / _RADAR_ADDR are defined
+            # above the branch now, so the engage-first takeover can use them too.
 
             # 0x764 + response_offset 0x8. Without 0x76C the reply is filtered
             # out in the panda before it reaches the host and this always fails.
@@ -4455,6 +5391,26 @@ def pipeline(args):
                     time.sleep(_sup_delay)
                     print("    self-test window elapsed -- suppressing now")
 
+            # WHICH SUPPRESSION THIS RUN USED. interface.py picks between the
+            # programming session and the 0x28 standby ladder off OP_RADAR_SUPPRESS
+            # and says nothing about it, so every d_p.*.log to date is unattributable
+            # -- and the two are not interchangeable. The programming session is what
+            # the community port with on-car results uses (opendbc PR #3355) and it
+            # makes every other module log a communication DTC against the radar;
+            # standby is this port's gentler route, added to keep those DTCs off the
+            # cluster. Whether either lets the car still engage is the open question,
+            # and it cannot be answered from logs that do not record which ran.
+            # Resolved the same way interface.py resolves it, including the
+            # default, so this line cannot drift from what actually runs: the
+            # default is standby only while longitudinal.py still HAS a standby
+            # ladder, and the pristine vendored module does not.
+            _has_standby = hasattr(_mazda_long, "enter_radar_standby")
+            _sup_mode = os.environ.get(
+                "OP_RADAR_SUPPRESS", "standby" if _has_standby else "programming")
+            if not _has_standby:
+                _sup_mode = "programming"
+            print("radar suppression: mode=%s (OP_RADAR_SUPPRESS; "
+                  "programming|standby|standby_keepdtc)" % _sup_mode)
             uds_sniff["on"] = True
             _t_hs = time.time()
             try:
@@ -4614,21 +5570,235 @@ def pipeline(args):
             # sources for frames that carry a counter, which is far more likely to
             # upset a consumer than the frames simply being absent. The shadow
             # exists to cover for a silenced radar; there is no silence to cover.
-            _no_shadow = coexist or os.environ.get("OP_ALPHA_NO_SHADOW") == "1"
+            # engage_first is included for the same reason as coexist: the radar is
+            # ALIVE for the first part of the run, so replaying its seven frames
+            # would put a second counter-bearing copy of each on the bus. The cost
+            # is that after the handover there is no shadow, so the front camera
+            # fault may appear at that point -- acceptable for a test whose whole
+            # question is whether the PCM keeps obeying, and preferable to
+            # corrupting the entry handshake we are relying on.
+            _no_shadow = coexist or engage_first or os.environ.get("OP_ALPHA_NO_SHADOW") == "1"
             if _no_longtx:
                 print("!!! OP_ALPHA_NO_LONGTX: radar suppressed, but NOTHING will be "
                       "sent on 0x21b/0x21c. Diagnostic only -- the PCM has no "
                       "longitudinal source, so cruise will not work.")
             threading.Thread(target=long_tx_thread, daemon=True,
                              kwargs={"tx_enabled": not _no_longtx}).start()
+
+            if engage_first:
+                def takeover_thread():
+                    """Wait for the RADAR to enter ACC, then take the frames over.
+
+                    The handover order is deliberate: open our tx first, let it
+                    overlap the radar for OVERLAP_S, and only then silence the
+                    radar. The PCM therefore never sees 0x21b stop -- it sees two
+                    sources briefly, then one. A gap is the thing most likely to
+                    make it drop ACC, and a gap is exactly what suppressing first
+                    would create.
+                    """
+                    OVERLAP_S = float(os.environ.get("OP_ALPHA_OVERLAP_S", "0.30"))
+                    while not stop_flag["v"]:
+                        # Entry needs a LIVE acc_active, not a remembered one.
+                        # Without rx_alive() a stale True left over from before a
+                        # link fault would start a handover -- suppressing the
+                        # radar on the strength of a reading we can no longer
+                        # confirm, at a speed we can no longer see.
+                        if not rx_alive() or not getattr(cs_can, "acc_active", False):
+                            time.sleep(0.02)
+                            continue
+
+                        _v = float(getattr(cs_can, "v_ego", 0.0)) * 3.6
+                        print("\n>>> HANDOVER: PCM reports acc_active=1 at %.1f kph. "
+                              "Opening our 0x21b/0x21c..." % _v, flush=True)
+                        longtx_gate["on"] = True
+                        time.sleep(OVERLAP_S)
+
+                        print(">>> HANDOVER: suppressing the radar (%.2f s overlap "
+                              "sent)..." % OVERLAP_S, flush=True)
+                        _n0 = can_census[0].get(0x21B, 0)
+                        _o0 = tx_state.get("crz_info_tx", 0)
+                        uds_sniff["on"] = True
+                        _sup_failed = None
+                        try:
+                            CarInterface.init(CP, _uds_can_recv, _uds_can_send)
+                        except Exception as _e:
+                            _sup_failed = _e
+                        finally:
+                            uds_sniff["on"] = False
+
+                        if _sup_failed is not None:
+                            # ABORT, do not keep transmitting. The radar is still
+                            # driving 0x21b/0x21c and we would be a second writer on
+                            # both -- which is what put the yellow radar warning on
+                            # the cluster on 2026-08-12 when this path raised.
+                            # Closing the gate puts the car back to exactly stock.
+                            longtx_gate["on"] = False
+                            print(">>> HANDOVER ABORTED: suppression raised: %s\n"
+                                  "    Our tx is CLOSED again -- the radar keeps "
+                                  "0x21b/0x21c and the car is back to stock.\n"
+                                  "    Nothing was taken over; this run proves "
+                                  "nothing about the PCM." % _sup_failed, flush=True)
+                            tx_state["handover_failed"] = True
+                            return
+
+                        # Did the RADAR actually stop? Census minus our own echo --
+                        # the same subtraction the radar-return watchdog uses.
+                        time.sleep(1.5)
+                        _foreign = ((can_census[0].get(0x21B, 0) - _n0)
+                                    - (tx_state.get("crz_info_tx", 0) - _o0))
+                        if _foreign > 20:
+                            # Same reasoning as the exception path: two writers on
+                            # 0x21b is worse than not taking over at all, so stand
+                            # down rather than report a success we did not get.
+                            longtx_gate["on"] = False
+                            print(">>> HANDOVER ABORTED: radar STILL SENDING (%d "
+                                  "foreign 0x21b in 1.5 s).\n    Our tx is CLOSED "
+                                  "again -- two writers on one address is worse than "
+                                  "none.\n    The car is back to stock." % _foreign,
+                                  flush=True)
+                            tx_state["handover_failed"] = True
+                            return
+                        print(">>> HANDOVER COMPLETE: radar silent, we own "
+                              "0x21b/0x21c with the PCM already in ACC.", flush=True)
+                        tx_state["handover_done"] = True
+                        tx_state["handovers"] = tx_state.get("handovers", 0) + 1
+
+                        # --- drive under openpilot until ACC ends ---------------
+                        #
+                        # rx_alive() is the second exit, and it is not optional.
+                        # acc_active is a decoded value with no expiry: when the
+                        # bus feed died on 2026-08-13 it stayed True and this
+                        # loop spun for 264 s, so the release below never ran and
+                        # the radar could not be freed by anything the driver
+                        # did. A stale True is not evidence ACC is on -- it is
+                        # evidence we have stopped being told.
+                        while (not stop_flag["v"] and rx_alive()
+                               and getattr(cs_can, "acc_active", False)):
+                            time.sleep(0.02)
+                        if stop_flag["v"]:
+                            return
+                        if not rx_alive():
+                            print("\n>>> RELEASE (RX DEAD): no bus-0 frame for "
+                                  "%.1fs. acc_active=%s is STALE, not current.\n"
+                                  "    Releasing the radar and re-arming."
+                                  % (rx_live.age(),
+                                     getattr(cs_can, "acc_active", None)), flush=True)
+
+                        # --- RELEASE ------------------------------------------
+                        # ACC has ended (brake, cancel, MAIN off). Two facts make
+                        # releasing the radar mandatory rather than optional:
+                        #
+                        #  1. Only the RADAR can perform the ACC entry handshake.
+                        #     Our frames cannot -- that is the wall this whole mode
+                        #     exists to route around. Holding it suppressed means
+                        #     ONE engagement per run and no way back.
+                        #  2. A suppressed radar with ACC off is pure cost: no
+                        #     FCW/AEB/SBS and a dash warning, with nothing using
+                        #     the suppression. OBSERVED 2026-08-12: exactly this,
+                        #     right after the first brake.
+                        #
+                        # Release is just dropping tester-present and letting the
+                        # session lapse. FINDINGS is explicit that this is the
+                        # clean exit and that explicitly requesting the default
+                        # session makes this radar fault.
+                        # KEEP TRANSMITTING. Only tester-present stops here.
+                        #
+                        # Closing the gate at the same time leaves NOBODY sending
+                        # 0x21b/0x21c for the ~6 s the radar's session takes to
+                        # lapse -- a total gap in the PCM's longitudinal input.
+                        # OBSERVED ON THE CAR 2026-08-12: after that gap the PCM
+                        # latched an MRCC fault and MAIN could not be switched on
+                        # again at all, which is far worse than the transient
+                        # warning it looks like.
+                        #
+                        # The entry handover already knows this: it opens our tx
+                        # FIRST and overlaps, precisely so the PCM never sees its
+                        # input stop. The exit has to be symmetric -- we hold the
+                        # frames until the radar is demonstrably back, and only
+                        # then stand down. What we send meanwhile is the radar's
+                        # own idle frame (long_active is False), so the PCM sees a
+                        # continuous, plausible stream throughout: us, then briefly
+                        # both, then the radar.
+                        radar_hold["on"] = False
+                        tx_state["handover_done"] = False   # re-arm the watchdog hold
+                        print("\n>>> RELEASE: ACC ended. Tester-present STOPPED; our "
+                              "idle frames KEEP FLOWING\n    so the PCM never loses "
+                              "its longitudinal input. Waiting for the radar...",
+                              flush=True)
+
+                        # WATCH 0x361, NOT 0x21b. Two nodes cannot transmit the same
+                        # CAN ID: while our tx is open the radar's 0x21b/0x21c lose
+                        # arbitration and never appear, so waiting for 0x21b here
+                        # waits for something we are ourselves blocking.
+                        #
+                        # MEASURED ON THE CAR 2026-08-12, this exact bug: the radar
+                        # came back at +5 s and resumed 0x361-0x499 at full 10 Hz,
+                        # while 21b/21c stayed pinned at 0 for the whole 20 s
+                        # timeout. The detector then gave up and killed the loop.
+                        #
+                        # 0x361-0x499 are the radar's OTHER frames, and engage-first
+                        # disables the shadow replay, so we never send them -- they
+                        # are an uncontaminated "the radar is alive again" signal.
+                        # Once seen we close our gate and the radar picks up
+                        # 0x21b/0x21c within a frame or two, so the gap is ~20 ms
+                        # instead of the 6 s that latched the PCM.
+                        _t_rel = time.time()
+                        while not stop_flag["v"] and time.time() - _t_rel < 20.0:
+                            _c0 = can_census[0].get(0x361, 0)
+                            time.sleep(1.0)
+                            _foreign_back = can_census[0].get(0x361, 0) - _c0
+                            if _foreign_back > 3:      # nominal 10 Hz
+                                # Radar is back and both of us are on the wire. NOW
+                                # stand down -- the same overlap-not-gap ordering the
+                                # entry handover uses, run in reverse.
+                                longtx_gate["on"] = False
+                                print(">>> RELEASE COMPLETE: radar alive again after "
+                                      "%.1f s (0x361 at %d Hz).\n"
+                                      "    Our tx now CLOSED so it can take back "
+                                      "0x21b/0x21c. AEB restored.\n"
+                                      "    Press SET again to re-engage."
+                                      % (time.time() - _t_rel, _foreign_back), flush=True)
+                                break
+                        else:
+                            if not stop_flag["v"]:
+                                # Do NOT keep transmitting indefinitely with no radar
+                                # and no ACC: stand down and say so.
+                                longtx_gate["on"] = False
+                                print(">>> RELEASE: radar did NOT return within 20 s. "
+                                      "Our tx CLOSED anyway.\n    Longitudinal cannot "
+                                      "re-arm; steering is unaffected. Restart to "
+                                      "recover.", flush=True)
+                                return
+                        if stop_flag["v"]:
+                            return
+                        radar_hold["on"] = True     # ready to hold the NEXT session
+                        # ...and loop back to waiting for the next acc_active.
+
+                threading.Thread(target=takeover_thread, daemon=True).start()
             # Put the radar's OTHER seven frames back. Started only
             # alongside alpha long, because the panda only accepts them
             # under mazda_longitudinal -- outside it they would be
             # rejected, which is the right failure direction.
-            if _no_shadow:
-                print("!!! OP_ALPHA_NO_SHADOW: the radar's other seven frames will "
-                      "NOT be replayed. Diagnostic only -- this is the condition "
-                      "that previously produced the front camera fault.")
+            # SUPERSEDED BY THE CARCONTROLLER'S RADAR HEARTBEAT.
+            #
+            # longitudinal.py (yummydirtx @ go-no-malfunction) now emits these seven
+            # frames itself via create_radar_heartbeat_messages, at
+            # RADAR_HEARTBEAT_STEP, to BOTH bus 0 and bus 2 -- and bus 2 is the half
+            # that matters, because the forward camera lives there and our replay
+            # never reached it. Running this thread as well would put a SECOND copy
+            # of 0x361-0x366/0x499 on bus 0, from a different counter sequence,
+            # which is worse than the absence it was written to cover.
+            #
+            # It also replays a CAPTURED snapshot, so its lead data is frozen at
+            # whatever the radar last saw; the heartbeat uses fixed empty-target
+            # templates, which is a coherent "no target" instead.
+            #
+            # OP_ALPHA_LOCAL_SHADOW=1 brings it back for A/B against the heartbeat.
+            _local_shadow = os.environ.get("OP_ALPHA_LOCAL_SHADOW") == "1"
+            if _no_shadow or not _local_shadow:
+                print("radar shadow: using the carcontroller's heartbeat "
+                      "(bus 0 + bus 2). The local bus-0-only replay is OFF -- set "
+                      "OP_ALPHA_LOCAL_SHADOW=1 to use it instead.")
             else:
                 threading.Thread(target=radar_shadow_thread, daemon=True).start()
             print(">>> ALPHA LONG ACTIVE: 0x21b/0x21c at 50 Hz, radar tester-present "
@@ -4674,7 +5844,13 @@ def pipeline(args):
                   "    Check that the panda runs the 19-ID mazda_filter.h build "
                   "(0x76C must reach the host).\n")
     else:
-        print("panda: SAFETY_SILENT -- dashcam mode, nothing transmitted.\n")
+        # NOOUTPUT, not SILENT -- every control_write above sets NOOUTPUT. The old
+        # message said SILENT and was simply wrong, which matters because the two
+        # differ in the one way that bites this build: SILENT cannot ACK, and with
+        # no harness relay that kills the forward camera. Reading "SAFETY_SILENT"
+        # here while hunting a camera fault points at exactly the wrong suspect.
+        print("panda: SAFETY_NOOUTPUT -- dashcam mode, nothing transmitted "
+              "(cam<->car forwarding and ACK stay alive).\n")
 
     # Per-service publish periods taken from the REAL openpilot service
     # frequencies, so each topic goes out at its nominal rate and selfdrived's
@@ -4962,7 +6138,8 @@ def pipeline(args):
                     _lact = mstate.get("action")
                     if _lact is not None:
                         # govern_accel() is the planner this board does not have:
-                        # accel ceiling, jerk limit, speed cap and a lead time gap.
+                        # accel ceiling, jerk limit and speed cap. NOT following
+                        # distance -- the model owns that (govern_accel step 1).
                         # Applied HERE rather than in the model so the raw action
                         # head stays visible in desired_accel for comparison.
                         _now_g = time.time()
@@ -4971,6 +6148,35 @@ def pipeline(args):
                         _a_raw = float(_lact["desiredAcceleration"])
                         _ld = mstate.get("lead_d")
                         _lp = mstate.get("lead_p")
+
+                        # ASYMMETRIC LEAD-PROBABILITY FILTER -- rises instantly,
+                        # decays slowly. Straight out of openpilot's radard.py:238,
+                        # whose comment is "keep lead when uncertain":
+                        #
+                        #     if lead_prob > filt.x: filt.x = lead_prob   # instant
+                        #     else:                  filt.update(lead_prob)
+                        #
+                        # WHY IT MATTERS HERE. This port tested the RAW per-frame
+                        # probability against a hard 0.5. MEASURED 2026-08-12, this
+                        # car's lead_p has a median of 0.023 and spikes to 0.995 --
+                        # so the lead appeared and vanished frame to frame, and the
+                        # MPC alternated between "lead ahead" and "clear road" (with
+                        # process_lead fabricating a fast lead 50 m out whenever it
+                        # read absent). Brake, release, brake, release: the
+                        # brake-checking reported from the car.
+                        #
+                        # Rising instantly keeps the response to a real lead sharp;
+                        # decaying over ~0.2 s stops a single dropped frame throwing
+                        # the plan away. Same constants as upstream.
+                        if _lp is not None:
+                            _lpf = _gov.get("lead_p_filt", 0.0)
+                            if _lp > _lpf:
+                                _lpf = float(_lp)                 # rise: instant
+                            else:                                  # decay: filtered
+                                _alpha = _dt_g / (0.2 + _dt_g)
+                                _lpf = _lpf + _alpha * (float(_lp) - _lpf)
+                            _gov["lead_p_filt"] = _lpf
+                            _lp = _lpf
                         # MPC first (if enabled): it PLANS the accel profile.
                         # govern_accel then runs on its output as a safety clamp.
                         if _mpc is not None:
@@ -4978,7 +6184,18 @@ def pipeline(args):
                                 _vego = float(cs_can.v_ego)
                                 _lead = _MpcLead(_ld, mstate.get("lead_v"),
                                                  mstate.get("lead_a"), _lp, _vego)
-                                _mpc.set_weights(prev_accel_constraint=True, personality=0)
+                                # FOLLOW DISTANCE. personality picks T_FOLLOW in
+                                # long_mpc.py:73 -- aggressive 1.25 s, standard
+                                # 1.45 s, relaxed 1.75 s -- and the MPC's desired
+                                # gap is T_FOLLOW * v_ego + STOP_DISTANCE.
+                                #
+                                # This was hardcoded to 0, and log.capnp:141 makes
+                                # 0 = AGGRESSIVE: the tightest gap openpilot offers,
+                                # chosen by accident rather than intent. That is the
+                                # "distance from the lead feels hardcoded" reported
+                                # from the car -- it was, and to the closest setting.
+                                # Default to standard, overridable.
+                                _mpc.set_weights(prev_accel_constraint=True, personality=_PERSONALITY)
                                 _mpc.set_cur_state(_mpc_state["v"], _mpc_state["a"])
                                 # CHASE THE DRIVER'S SET SPEED, NOT A CONFIG CONSTANT.
                                 #
@@ -5011,10 +6228,90 @@ def pipeline(args):
                                 _env_t = os.environ.get("OP_V_TARGET_KPH")
                                 if _env_t:
                                     _vt = float(_env_t) / 3.6
+                                # SPEED-LIMIT TARGET (OP_SPEED_LIMIT=1).
+                                #
+                                # Runs AFTER the set-speed logic above and takes the
+                                # LOWER of the two whenever both are known, so the
+                                # driver can always ask for less than the limit but
+                                # never for more by leaving a stale set speed behind.
+                                # OP_V_TARGET_KPH still wins outright -- it is the
+                                # explicit manual override and is what the bench
+                                # tests set.
+                                #
+                                # STANDARD aims at the limit + OP_STD_OVER_MPH; MADS
+                                # at the limit + OP_MADS_OVER_MPH. The mode comes from the
+                                # --mads flag, so one switch changes both how
+                                # openpilot engages and what it aims for.
+                                if _speed_target is not None and not _env_t:
+                                    try:
+                                        # v_ego lets SpeedTarget reject an INFERRED
+                                        # limit far below our actual speed -- a
+                                        # side-road match, not a real limit.
+                                        _lim_kph = _speed_target.update(
+                                            v_ego_kph=float(cs_can.v_ego) * 3.6)
+                                        _lim_mps = _lim_kph / 3.6
+                                        # Publish for the HUD. --display serves no
+                                        # web page, so without this the posted limit
+                                        # the car is aiming at is invisible in the
+                                        # one mode you actually watch while driving.
+                                        _sts = _speed_target.status()
+                                        STATE["speed_limit_kph"] = _sts["limit_kph"]
+                                        STATE["speed_limit_inferred"] = bool(_sts["inferred"])
+                                        STATE["speed_target_kph"] = _sts["target_kph"]
+                                        STATE["speed_limit_mode"] = _sts["mode"]
+                                        # _vt is None when no set speed was
+                                        # trustworthy; then the limit IS the target
+                                        # rather than the current-speed hold.
+                                        _vt = _lim_mps if _vt is None else min(_vt, _lim_mps)
+                                        # COAST BAND, MPC SIDE. DORMANT: the MPC is
+                                        # off (OP_MPC is unset everywhere in this
+                                        # tree) and the car is driven by the action
+                                        # head, so govern_accel step 2b is the band
+                                        # that actually runs. This exists so the two
+                                        # paths cannot disagree if the flag is ever
+                                        # flipped -- without it, turning the MPC on
+                                        # would silently restore the brake-checking.
+                                        #
+                                        # govern_accel's band (step 2b) only clamps
+                                        # the OUTPUT, and the MPC is upstream of it:
+                                        # handed a target the car is already above,
+                                        # the MPC plans a deceleration back to it and
+                                        # that braking passes straight through the
+                                        # band, because govern_accel cannot tell
+                                        # cap-braking apart from a lead or a curve.
+                                        # The band would work for the e2e path and do
+                                        # nothing for the MPC one.
+                                        #
+                                        # So do not show the MPC an overshoot it is
+                                        # meant to ignore. Inside the band, target the
+                                        # CURRENT speed -- the MPC then holds instead
+                                        # of braking, and cannot accelerate either
+                                        # because the target is where the car already
+                                        # is. Past the band the target snaps back and
+                                        # the MPC brings the car down to it.
+                                        # Only when the LIMIT is what is binding. If a
+                                        # driver set speed is lower, that is a request,
+                                        # not a cap, and stock cruise holds it -- the
+                                        # band must not quietly raise it. Never past
+                                        # V_MAX_KPH either, matching govern_accel.
+                                        _vego_mps = float(cs_can.v_ego)
+                                        _brake_mps = min(_lim_mps + V_COAST_BAND_KPH / 3.6,
+                                                         V_MAX_KPH / 3.6)
+                                        if _vt >= _lim_mps and _lim_mps < _vego_mps <= _brake_mps:
+                                            _vt = _vego_mps
+                                    except Exception as _ste:
+                                        # Never let a lookup fault the control loop:
+                                        # fall through to whatever _vt already was.
+                                        # time.time() rather than the loop's `now`
+                                        # on purpose -- a NameError raised from an
+                                        # exception handler would take out the
+                                        # thread this exists to protect.
+                                        if int(time.time()) % 10 == 0:
+                                            print("SPEEDLIM update failed:", _ste, flush=True)
                                 if _vt is None:
                                     _vt = _vego
                                 _mpc_state["v_cruise"] = _vt
-                                _mpc.update(_MpcRadar(_lead), _vt, personality=0)
+                                _mpc.update(_MpcRadar(_lead), _vt, personality=_PERSONALITY)
                                 _a_traj = np.interp(_CTRL_T, _T_IDXS_MPC, _mpc.a_solution)
                                 _v_traj = np.interp(_CTRL_T, _T_IDXS_MPC, _mpc.v_solution)
                                 # advance the planner's own state 1 tick, exactly
@@ -5026,16 +6323,68 @@ def pipeline(args):
                                                       + _dt_g * (_mpc_state["a"] + _a_prev_mpc) / 2.0)
                                 # pull v back toward reality so it cannot diverge
                                 _mpc_state["v"] += 0.15 * (_vego - _mpc_state["v"])
-                                _a_raw, _ss = get_accel_from_plan(
+                                _a_mpc, _ss_mpc = get_accel_from_plan(
                                     _v_traj, _a_traj, _CTRL_T,
                                     action_t=_MPC_ACTION_T, vEgoStopping=0.5)
-                                _lact["shouldStop"] = bool(_ss)
+
+                                # BLEND WITH THE ACTION HEAD, as upstream does.
+                                #
+                                # longitudinal_planner.py:135-142 does NOT choose
+                                # between the two -- in experimental mode it runs
+                                # both and takes the more conservative:
+                                #     output_a_target = min(a_e2e, a_mpc)
+                                #     should_stop     = stop_e2e or stop_mpc
+                                #
+                                # This port used to overwrite _a_raw with the MPC's
+                                # value and drop the action head entirely, which
+                                # threw away the only component that has ever seen a
+                                # stopped car. The MPC's whole view of the road is
+                                # one lead object, and MEASURED 2026-08-12 that lead
+                                # never arrives: lead_p peaks at 0.344 against a 0.5
+                                # threshold, so process_lead() fabricates a clear
+                                # road on every frame. An optimiser tracking a speed
+                                # target with no obstacle input is exactly as
+                                # unnatural as it sounds, and it is what "panics near
+                                # stationary leads" and "does not feel natural"
+                                # were describing.
+                                #
+                                # min() keeps the MPC's smooth speed-keeping and jerk
+                                # shaping while letting the model brake HARDER
+                                # whenever it recognises something the MPC cannot
+                                # see. The model can never make the car accelerate
+                                # more than the MPC planned -- only less.
+                                _a_e2e = _a_raw
+                                _ss_e2e = bool(_lact.get("shouldStop"))
+                                _a_raw = min(_a_e2e, _a_mpc)
+                                _lact["shouldStop"] = bool(_ss_mpc or _ss_e2e)
+                                _gov["a_mpc"] = _a_mpc
+                                _gov["a_e2e"] = _a_e2e
+                                # Which one is binding, so the log says who is driving.
+                                _gov["src"] = "e2e" if _a_e2e < _a_mpc else "mpc"
                                 _gov["mpc"] = 1
                             except Exception as _e:
                                 _gov["mpc"] = 0
                                 _gov["mpc_err"] = "%s" % type(_e).__name__
+                        # Live speed cap for the e2e path. With the MPC on, the
+                        # target is already folded into _vt and the MPC plans to
+                        # it; govern_accel then re-applies it as a backstop, which
+                        # is harmless. With the MPC off this is the ONLY thing
+                        # that makes the posted limit matter.
+                        _cap_kph = None
+                        if _speed_target is not None:
+                            try:
+                                _cap_kph = _speed_target.update(
+                                    v_ego_kph=float(cs_can.v_ego) * 3.6)
+                                _sts = _speed_target.status()
+                                STATE["speed_limit_kph"] = _sts["limit_kph"]
+                                STATE["speed_limit_inferred"] = bool(_sts["inferred"])
+                                STATE["speed_target_kph"] = _sts["target_kph"]
+                                STATE["speed_limit_mode"] = _sts["mode"]
+                            except Exception:
+                                _cap_kph = None
                         _a_cmd, _why = govern_accel(_a_raw, float(cs_can.v_ego),
-                                                    _ld, _lp, _gov["a"], _dt_g)
+                                                    _ld, _lp, _gov["a"], _dt_g,
+                                                    v_max_kph=_cap_kph)
                         _gov["a"] = _a_cmd
                         _gov["why"] = _why
                         _gov["raw"] = _a_raw
@@ -5299,6 +6648,16 @@ def pipeline(args):
                             "drain_gap_ms": round(float(getattr(panda, "max_gap_ms", -1.0)), 1),
                             "drain_gap_max_ms": round(float(getattr(panda, "max_gap_ever", -1.0)), 1),
                             "drain_over_budget": int(getattr(panda, "over_budget", -1)),
+                            # HOW MUCH the host retrieved, not just how often it
+                            # asked. drain_gap can look healthy while the queue
+                            # overflows, because one 16 KiB transfer only holds
+                            # ~1260 packets -- less than one worst-case gap of
+                            # traffic. drain_reads/can_recv > 1 means the extra
+                            # transfers are doing real work; drain_capped > 0
+                            # means even 8 of them were not enough and frames were
+                            # left in the firmware queue to overflow.
+                            "drain_reads": int(getattr(panda, "drain_reads", -1)),
+                            "drain_capped": int(getattr(panda, "drain_capped", -1)),
                             # CAR STATE THE SHIM CANNOT CARRY.
                             #
                             # _CarStateFromMsgq maps only what stock carState has,
@@ -5340,6 +6699,10 @@ def pipeline(args):
                     except Exception:
                         pass
                 g = lambda a, d=0: getattr(cs_can, a, d)
+                # Bus 0 core health, from the cache can_thread refreshes at 1 Hz.
+                # Keys are can_health_state's own names ("rx"/"fwd"), not the
+                # firmware struct's total_rx_cnt/total_fwd_cnt.
+                _canh = (can_health_state["v"] or {}).get(0, {})
                 print("CAR %8.2fs v=%5.1fkph gear_rpm=%-5s | crz_avail=%d crz_en=%d "
                       "acc_armed=%d acc_active=%d brake=%d gas=%d "
                       "| drv_trq=%+6.1f pressed=%d angle=%+7.2f "
@@ -5350,15 +6713,54 @@ def pipeline(args):
                       # config constant (V_MAX_KPH, 116) and nothing displayed it,
                       # so "accelerating toward 116 kph" looked identical to normal
                       # operation right up until the PCM started obeying us.
-                      "| mpc=%d vtgt=%.0f mv=%.1f/%.1f ma=%+.2f a_raw=%+.2f a_cmd=%+.2f lim=%-10s "
+                      # slim= is the speed-limit target, empty unless
+                      # OP_SPEED_LIMIT=1. Format: "tgt=N lim=N[i] STD|MADS+N".
+                      # The trailing 'i' means the limit was INFERRED from the
+                      # highway type rather than read off a maxspeed tag -- only
+                      # 10.9% of NY ways carry one, so expect to see it often.
+                      # src is which of the two blended sources is BINDING:
+                      # "mpc" = the optimiser's plan, "e2e" = the model braking
+                      # harder than the MPC planned. Upstream takes min(e2e, mpc),
+                      # so seeing e2e means the model spotted something the MPC's
+                      # single lead object did not. A run where src never reads e2e
+                      # means the action head is not reaching the blend.
+                      "| mpc=%d/%-3s vtgt=%.0f%s mv=%.1f/%.1f ma=%+.2f a_raw=%+.2f a_cmd=%+.2f lim=%-10s "
                       "| txgap=%.0f/%.0fms late=%d "
                       "| ang_off=%+.2f(%d) "
                       "| lc_state=%d lc_prob=%.3f desire=%d plan_y=%s "
                       # ACC set speed, raw and both candidate scalings, so ONE look
-                      # at the cluster settles the DBC's ambiguous unit. -1 means
-                      # 0x21F never arrived.
-                      "| setspd raw=%d a=%.1f b=%.1f "
+                      # at the cluster settles the DBC's ambiguous unit.
+                      #
+                      # raw=-1 means 0x21F has not arrived ONCE since startup --
+                      # it does NOT mean the frame is absent now. The three value
+                      # fields are a latch that is never invalidated (see the note
+                      # in dashcam.py's CarStateFromCAN), so under suppression they
+                      # keep reading whatever was latched before it. age is the
+                      # field that says whether CRZ_EVENTS is still on the bus:
+                      # -1 = never seen, and a value that climbs past ~0.1 s means
+                      # the 50 Hz frame has stopped. THAT is the measurement that
+                      # decides whether the radar's HMI half survives suppression.
+                      "| setspd raw=%d a=%.1f b=%.1f age=%.1fs "
+                      # Rising-edge counts for SET+/SET-/RES/OFF off 0x09d, and
+                      # how long ago the last one landed. Levels are useless at
+                      # 1 Hz -- a press is a few hundred ms and the sample lands
+                      # between presses. Without these, "pressing SET does
+                      # nothing" cannot be told apart from "SET was never
+                      # pressed", which is the question the alpha-long runs of
+                      # 2026-08-12 were unable to answer about themselves.
+                      "| btn +%d/-%d/R%d/O%d last=%.0fs "
                       "| tx_blocked=%d rx_invalid=%d "
+                      # CAN CORE HEALTH, on the panda's own line. rx is the
+                      # silicon's total_rx_cnt: if it stops advancing while the
+                      # ignition is on, the core is wedged in bxCAN init -- it then
+                      # stops forwarding cam <-> bus 0 and the cluster raises a
+                      # front camera sensor fault that looks exactly like the
+                      # alpha-long radar one. bus_off/txe/rxe all read HEALTHY in
+                      # that state (a core in init does not error-count), so rx is
+                      # the field to watch; the others catch the ordinary
+                      # error-passive / bus-off failures instead.
+                      # wedge counts the automatic 0xd8 recoveries.
+                      "| can rx=%d fwd=%d off=%d txe=%d rxe=%d wedge=%d "
                       # Alpha long, on the panda's own log line. Without this the
                       # only place these appeared was a web field fed by the model
                       # role, which never has them -- see the note in the status
@@ -5394,8 +6796,9 @@ def pipeline(args):
                          int(cam_state.get("ck_lnv", 0)),
                          int(cam_state.get("ck_ldw", 0)),
                          int(cam_state.get("ck_ang", 0)),
-                         int(_gov.get("mpc", 0)),
+                         int(_gov.get("mpc", 0)), str(_gov.get("src", "-")),
                          float(_mpc_state.get("v_cruise", 0.0)) * 3.6,
+                         (" [%s]" % _speed_target.line()) if _speed_target is not None else "",
                          float(_mpc_state["v"]) * 3.6, float(cs_can.v_ego) * 3.6,
                          float(_mpc_state["a"]),
                          float(_gov.get("raw", 0.0)), float(_gov.get("a", 0.0)),
@@ -5412,8 +6815,28 @@ def pipeline(args):
                          int(getattr(cs_can, "set_speed_raw", -1)),
                          float(getattr(cs_can, "set_speed_kph", -1.0)),
                          float(getattr(cs_can, "set_speed_ms", -1.0)) * 3.6,
+                         ((now - _sst) if (_sst := float(getattr(cs_can, "set_speed_t", 0.0)))
+                          else -1.0),
+                         *(lambda _bc: (int(_bc.get("set_p", 0)), int(_bc.get("set_m", 0)),
+                                        int(_bc.get("res", 0)), int(_bc.get("off", 0))))(
+                             getattr(cs_can, "btn_counts", {})),
+                         ((now - _blt) if (_blt := float(getattr(cs_can, "btn_last_t", 0.0)))
+                          else -1.0),
                          int(health_state["v"][3]) if health_state["v"] else -1,
                          int(health_state["v"][4]) if health_state["v"] else -1,
+                         # Read from the cached per-bus health that can_thread
+                         # already refreshes at 1 Hz -- NOT a fresh control
+                         # transfer. This line runs on the tx path and the
+                         # panda_lock is what the 0x243 stream is most sensitive
+                         # to; adding a USB round trip here to print a diagnostic
+                         # would risk causing the very irregularity it exists to
+                         # help diagnose.
+                         int(_canh.get("rx", -1)),
+                         int(_canh.get("fwd", -1)),
+                         int(_canh.get("bus_off", -1)),
+                         int(_canh.get("tx_err", -1)),
+                         int(_canh.get("rx_err", -1)),
+                         int(getattr(panda, "wedge_recoveries", 0)),
                          ("| long tx=%d crz=%d tp=%d err=%d%s "
                           % (int(tx_state.get("long_tx_frames", 0)),
                              int(tx_state.get("crz_info_tx", 0)),
@@ -5433,6 +6856,42 @@ def pipeline(args):
                     _evs.append("%s[%s]" % (str(e.name), _t or "-"))
                 print("EVT %8.2fs %s" % (now - t0, "  ".join(_evs) or "(no events)"),
                       flush=True)
+                if alpha_long:
+                    # SUPPRESSION CENSUS. What is still on bus 0, per address,
+                    # over the last window, with our own transmits subtracted.
+                    #
+                    # This exists because the port has been reasoning about
+                    # "which frames does suppression silence?" from indirect
+                    # evidence -- a latched set speed, a cluster message -- and
+                    # getting it wrong. can_census counts everything can_thread
+                    # sees, including the echo of our own frames, so a raw count
+                    # of 0x21b says nothing; the delta minus _ourtx is the
+                    # radar's actual share. Same subtraction the 0x21b watchdog
+                    # in long_tx_thread does, applied to every address at once.
+                    #
+                    # 0x21f is the one to read first: it is the radar's third
+                    # longitudinal output and NOTHING in this port has ever
+                    # transmitted it, so its count here is the car's alone. If it
+                    # holds ~50 Hz under suppression the radar's HMI half is
+                    # still running and engagement should be reachable the way
+                    # upstream reaches it. If it goes to 0, the ACC state machine
+                    # went with it and it has to be synthesised.
+                    _cw = now - diag.get("ct", now)
+                    _prev = diag.get("census", {})
+                    _pours = diag.get("census_ours", {})
+                    _cur = {_a: can_census[0].get(_a, 0) for _a in CENSUS_IDS}
+                    _co = {_a: _ourtx.get(_a, 0) for _a in CENSUS_IDS}
+                    if _cw >= 0.5 and _prev:
+                        _parts = []
+                        for _a in CENSUS_IDS:
+                            _n = (_cur[_a] - _prev.get(_a, 0)) - (_co[_a] - _pours.get(_a, 0))
+                            # Clamp only the print: a small negative means our own
+                            # echo outran the census by a frame across the window
+                            # boundary, not that the car sent a negative number.
+                            _parts.append("%03x=%.0f" % (_a, max(_n, 0) / _cw))
+                        print("CENSUS %6.2fs bus0 Hz (ours subtracted) %s"
+                              % (now - t0, " ".join(_parts)), flush=True)
+                    diag["ct"], diag["census"], diag["census_ours"] = now, _cur, _co
                 if (now - diag.get("rt", 0)) >= 5.0:
                     diag["rt"] = now
                     _parts = []
@@ -5441,6 +6900,11 @@ def pipeline(args):
                         if _r is None:
                             _parts.append("%s:SILENT" % RADAR_NAMES[_a])
                         else:
+                            # age is time since this address was last seen on the
+                            # bus -- which, once the shadow replay is running, is
+                            # OUR echo and not the radar. A healthy replay pins it
+                            # near zero and says nothing about whether the radar is
+                            # back; that is what the CENSUS line is for.
                             _parts.append("%s:%d age=%.1fs %s" % (RADAR_NAMES[_a], _r["n"],
                                           now - _r["t"], _r["d"].hex()))
                     print("RADAR %7.2fs %s" % (now - t0, "  ".join(_parts)), flush=True)
@@ -5661,6 +7125,20 @@ def pipeline(args):
                     accel_limit=str(_gov["why"]),
                     lead_d_m=(round(float(mstate["lead_d"]), 1)
                               if mstate.get("lead_d") is not None else None),
+                    # lead_v_ms and lead_p are logged so the ABSOLUTE-vs-RELATIVE
+                    # question can be answered from data rather than argued from
+                    # source. openpilot's radard.py settles it (lead.v[0] is ground
+                    # speed -- see the note in _MpcLead), but that convention had
+                    # already been guessed wrong once here, and the cost was a car
+                    # that accelerated at leads instead of holding station.
+                    #
+                    # The check: compare lead_v_ms against v_ego + d(lead_d_m)/dt.
+                    # If they agree, it is absolute. If lead_v_ms instead matches
+                    # d(lead_d_m)/dt alone, it is relative and _MpcLead is wrong.
+                    lead_v_ms=(round(float(mstate["lead_v"]), 2)
+                               if mstate.get("lead_v") is not None else None),
+                    lead_p=(round(float(mstate["lead_p"]), 3)
+                            if mstate.get("lead_p") is not None else None),
                     long_tx_err=int(tx_state.get("long_tx_err", 0)),
                     long_tx_last_err=tx_state.get("long_tx_last_err", ""),
                     long_halted=bool(tx_state.get("long_halted", False)),

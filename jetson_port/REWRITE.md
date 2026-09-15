@@ -64,7 +64,7 @@ check that cannot fail is not evidence.
 Each layer testable on the bench before the next. Do not move up until the
 current layer is proven.
 
-**1. Clock, flash, linker.** 180 MHz PLL. Sector map for the F407. Keep
+**1. Clock, flash, linker.** 168 MHz PLL (the F407 ceiling -- 180 is the F446). Sector map for the F407. Keep
 `.isr_vector` at 0x8004000 if you keep the bootstub, and keep the bootstub --
 it is what lets you recover a bad flash without SWD.
 

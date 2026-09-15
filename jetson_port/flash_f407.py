@@ -20,7 +20,7 @@ import time
 sys.path.insert(0, "/home/tran/op_fork/jetson_port")
 from usb_panda import UsbPanda
 
-FW = "/home/tran/panda_f446/board/obj/panda_f407.bin.signed"
+FW = "/home/tran/panda/board/obj/panda_f407.bin.signed"
 SAFETY_NOOUTPUT = 19
 
 
